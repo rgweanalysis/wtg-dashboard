@@ -1,0 +1,18 @@
+{
+  "version": "fixed-v5-aaw-english-clean",
+  "main_html": "WTG_Dashboard.html",
+  "css": "css/style.css",
+  "js": "js/app.js",
+  "fixes": [
+    "Fixed ReferenceError: day is not defined in renderUnifiedReport",
+    "Kept v3 iframe/srcdoc syntax and table-guard fixes",
+    "Kept insertBefore safe insertion fix"
+  ],
+  "notes": [
+    "Open the whole folder in VS Code",
+    "Run WTG_Dashboard.html with Live Server"
+  ],
+  "changes": [
+    "AAW defaults to English and ignores previous Arabic localStorage preference."
+  ]
+}

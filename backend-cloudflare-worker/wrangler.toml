@@ -1,0 +1,8 @@
+name = "wtg-aaw-backend"
+main = "src/index.js"
+compatibility_date = "2025-08-01"
+
+# For production, replace * with your GitHub Pages origin, for example:
+# ALLOWED_ORIGIN = "https://your-user.github.io"
+[vars]
+ALLOWED_ORIGIN = "*"
