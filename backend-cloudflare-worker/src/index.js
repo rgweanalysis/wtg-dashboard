@@ -97,6 +97,81 @@ function stringifyRowsForBrowser(rows) {
   });
 }
 
+function splitAWSDelimitedLine(line, delimiter) {
+  const result = [];
+  let current = "";
+  let quoted = false;
+  const text = String(line || "");
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (quoted && text[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (ch === delimiter && !quoted) {
+      result.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function detectAWSDelimiter(firstLine) {
+  const candidates = [",", ";", "\t", "|"];
+  let best = ",";
+  let bestCount = 0;
+  for (const delimiter of candidates) {
+    const count = splitAWSDelimitedLine(firstLine, delimiter).length;
+    if (count > bestCount) {
+      best = delimiter;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+function parseAWSDelimitedText(text) {
+  const cleanText = String(text || "").replace(/^\uFEFF/, "");
+  const physicalLines = cleanText.split(/\r\n|\n|\r/);
+  const firstNonEmpty = physicalLines.find((line) => String(line || "").trim() !== "") || "";
+  const delimiter = detectAWSDelimiter(firstNonEmpty);
+  const records = [];
+  let current = "";
+  let quoteCount = 0;
+  for (const line of physicalLines) {
+    current += (current ? "\n" : "") + line;
+    for (let i = 0; i < line.length; i += 1) {
+      if (line[i] === '"') quoteCount += 1;
+    }
+    if (quoteCount % 2 === 1) continue;
+    const record = splitAWSDelimitedLine(current, delimiter).map((cell) => String(cell == null ? "" : cell).trim());
+    records.push(record);
+    current = "";
+    quoteCount = 0;
+  }
+  if (current) records.push(splitAWSDelimitedLine(current, delimiter).map((cell) => String(cell == null ? "" : cell).trim()));
+  while (records.length && records[0].every((cell) => !String(cell || "").trim())) records.shift();
+  const header = (records.shift() || []).map((cell) => String(cell || "").trim());
+  const rows = [];
+  for (const record of records) {
+    if (!record || record.every((cell) => !String(cell || "").trim())) continue;
+    const row = {};
+    header.forEach((h, index) => {
+      if (!h) return;
+      row[h] = record[index] != null ? String(record[index]).trim() : "";
+    });
+    rows.push(row);
+  }
+  const columns = header.filter(Boolean);
+  return { columns, header: columns, data: rows };
+}
+
 function orderedColumnsFromRows(rows) {
   const columns = [];
   const seen = new Set();
@@ -120,24 +195,27 @@ async function parseGenericTableFile(file, label) {
   const bytes = new Uint8Array(arrayBuffer);
   const fileName = file.name || label;
   const lowerName = fileName.toLowerCase();
-  let workbook;
+  let sheetName = "CSV";
+  let parsedTextTable;
 
   if (lowerName.endsWith(".csv") || lowerName.endsWith(".txt")) {
-    const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
-    workbook = XLSX.read(text, { type: "string", cellDates: false, raw: false });
+    const text = new TextDecoder("utf-8").decode(bytes).replace(/^﻿/, "");
+    parsedTextTable = parseAWSDelimitedText(text);
   } else {
-    workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
+    const workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
+    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+      throw new Error(`${label} file does not contain any sheets.`);
+    }
+    sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    // Match the old frontend-only AWS behavior: Excel -> CSV text -> the same CSV parser.
+    // This preserves Start Date, End Date and Total Duration values exactly as the AWS UI expects.
+    const csv = XLSX.utils.sheet_to_csv(sheet, { FS: ",", RS: "\n", blankrows: false });
+    parsedTextTable = parseAWSDelimitedText(csv);
   }
 
-  if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
-    throw new Error(`${label} file does not contain any sheets.`);
-  }
-
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
-  const rows = stringifyRowsForBrowser(rawRows).filter((row) => Object.values(row).some((value) => String(value || "").trim() !== ""));
-  const columns = orderedColumnsFromRows(rows);
+  const rows = stringifyRowsForBrowser(parsedTextTable.data).filter((row) => Object.values(row).some((value) => String(value || "").trim() !== ""));
+  const columns = parsedTextTable.columns && parsedTextTable.columns.length ? parsedTextTable.columns : orderedColumnsFromRows(rows);
 
   return {
     label,
@@ -309,7 +387,12 @@ function getAWSEventCode(row, colMap) {
 
 function getAWSRowBounds(row, colMap) {
   const start = parseAWSDateValue(getAWSCell(row, colMap.start));
-  const end = parseAWSDateValue(getAWSCell(row, colMap.end)) || start;
+  let end = parseAWSDateValue(getAWSCell(row, colMap.end));
+  if (start && !end && colMap.duration) {
+    const sec = parseAWSDurationSeconds(getAWSCell(row, colMap.duration));
+    if (sec > 0) end = new Date(start.getTime() + sec * 1000);
+  }
+  if (!end) end = start;
   return { start, end };
 }
 
