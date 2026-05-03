@@ -14,18 +14,15 @@ function jsonResponse(request, env, body, status = 200) {
 }
 
 function corsHeaders(request, env) {
-  const requestOrigin = request.headers.get("Origin") || "*";
-  const allowedRaw = env.ALLOWED_ORIGIN || "*";
-  const allowed = allowedRaw.split(",").map((item) => item.trim()).filter(Boolean);
-  const allowOrigin = allowed.includes("*") || allowed.includes(requestOrigin)
-    ? requestOrigin
-    : allowed[0] || "*";
-
+  // The dashboard does not use cookies/credentials for Worker calls.
+  // Wildcard CORS prevents Cloudflare Pages -> Worker uploads from being blocked
+  // even when the Worker returns an error response during parsing.
   return {
-    "access-control-allow-origin": allowOrigin,
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type",
-    "access-control-max-age": "86400"
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin"
   };
 }
 
