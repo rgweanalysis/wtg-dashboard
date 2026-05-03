@@ -499,6 +499,170 @@ function buildAWSBackendAnalysis(rows, colMap) {
   };
 }
 
+
+
+function splitXMinCsvLine(line, delimiter) {
+  const out = [];
+  let cur = "";
+  let quoted = false;
+  const text = String(line || "");
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (quoted && text[i + 1] === '"') {
+        cur += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (ch === delimiter && !quoted) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function detectXMinDelimiter(headerLine) {
+  const text = String(headerLine || "");
+  const candidates = [";", ",", "\t"];
+  let best = ";";
+  let bestCount = -1;
+  for (const delimiter of candidates) {
+    const count = (text.match(new RegExp(delimiter === "\t" ? "\\t" : delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
+    if (count > bestCount) {
+      best = delimiter;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+function normalizeXMinCell(value) {
+  return String(value == null ? "" : value).replace(/^\uFEFF/, "").trim();
+}
+
+async function parseXMinTextFile(file, label = "xmin") {
+  if (!file || typeof file.arrayBuffer !== "function") {
+    throw new Error(`${label} is not a valid uploaded file.`);
+  }
+  const arrayBuffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  let text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
+  text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = text.split("\n").filter((line) => String(line || "").trim() !== "");
+
+  if (!lines.length) {
+    return {
+      label,
+      fileName: file.name || label,
+      fileType: file.type || "text/csv",
+      fileSizeBytes: file.size || bytes.byteLength,
+      rowsCount: 0,
+      delimiter: ";",
+      columns: [],
+      variables: [],
+      devices: [],
+      rows: [],
+      preview: []
+    };
+  }
+
+  const delimiter = detectXMinDelimiter(lines[0]);
+  const headers = splitXMinCsvLine(lines[0], delimiter).map((header, index) => normalizeXMinCell(header) || `Column ${index + 1}`);
+  const rows = [];
+  for (let i = 1; i < lines.length; i += 1) {
+    const cells = splitXMinCsvLine(lines[i], delimiter);
+    if (cells.length !== headers.length) continue;
+    const obj = {};
+    for (let j = 0; j < headers.length; j += 1) {
+      let key = headers[j] || `Column ${j + 1}`;
+      key = key.replace(/^\uFEFF/, "").trim();
+      let value = normalizeXMinCell(cells[j]);
+      if (key === "Date") value = value.replace("T", " ");
+      obj[key] = value;
+    }
+    if (obj["\uFEFFDevice"]) {
+      obj.Device = obj["\uFEFFDevice"];
+      delete obj["\uFEFFDevice"];
+    }
+    if (Object.values(obj).some((value) => String(value || "").trim() !== "")) rows.push(obj);
+  }
+
+  const columns = rows.length ? orderedColumnsFromRows(rows) : headers.filter(Boolean);
+  const variables = columns.filter((key) => key !== "Device" && key !== "Date");
+  const devices = Array.from(new Set(rows.map((row) => String(row.Device || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+
+  return {
+    label,
+    fileName: file.name || label,
+    fileType: file.type || "text/csv",
+    fileSizeBytes: file.size || bytes.byteLength,
+    rowsCount: rows.length,
+    delimiter,
+    columns,
+    variables,
+    devices,
+    rows,
+    preview: rows.slice(0, MAX_PREVIEW_ROWS)
+  };
+}
+
+async function handleXMinUpload(request, env) {
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "Expected multipart/form-data with an X-Minute CSV file."
+    }, 400);
+  }
+
+  const form = await request.formData();
+  const file = form.get("file") || form.get("xmin") || form.get("csv");
+  if (!file || typeof file.arrayBuffer !== "function") {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "No valid X-Minute file was uploaded. Send a file field named file, xmin, or csv."
+    }, 400);
+  }
+
+  const parsed = await parseXMinTextFile(file, "xmin");
+  return jsonResponse(request, env, {
+    success: true,
+    module: "X-Minute",
+    phase: "backend-upload-parse",
+    storageMode: "temporary-request-memory",
+    persistentStorage: false,
+    note: "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
+    receivedAt: new Date().toISOString(),
+    file: {
+      fileName: parsed.fileName,
+      fileType: parsed.fileType,
+      fileSizeBytes: parsed.fileSizeBytes,
+      rowsCount: parsed.rowsCount,
+      delimiter: parsed.delimiter,
+      columns: parsed.columns,
+      variables: parsed.variables,
+      devices: parsed.devices,
+      preview: parsed.preview
+    },
+    parsed: {
+      header: parsed.columns,
+      variables: parsed.variables,
+      devices: parsed.devices,
+      data: parsed.rows
+    },
+    summary: {
+      totalRows: parsed.rowsCount,
+      devicesCount: parsed.devices.length,
+      variablesCount: parsed.variables.length
+    }
+  });
+}
+
 async function handleAWSUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
@@ -1108,9 +1272,9 @@ export default {
       if (url.pathname === "/" || url.pathname === "/api/health") {
         return jsonResponse(request, env, {
           success: true,
-          service: "WTG AAW Cloudflare Backend",
+          service: "WTG Cloudflare Backend",
           status: "ok",
-          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare", "POST /api/aws/upload"],
+          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare", "POST /api/aws/upload", "POST /api/xmin/upload"],
           storageMode: "temporary-request-memory"
         });
       }
@@ -1125,6 +1289,10 @@ export default {
 
       if (url.pathname === "/api/aws/upload" && request.method === "POST") {
         return await handleAWSUpload(request, env);
+      }
+
+      if (url.pathname === "/api/xmin/upload" && request.method === "POST") {
+        return await handleXMinUpload(request, env);
       }
 
       return jsonResponse(request, env, {
