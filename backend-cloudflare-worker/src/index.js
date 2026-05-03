@@ -91,21 +91,65 @@ function normalizeValue(value) {
   return value == null ? "" : String(value).trim().toUpperCase();
 }
 
-function autoMapColumns(columns) {
-  const low = columns.map((column) => String(column).toLowerCase());
-  const find = (candidates) => {
-    for (const candidate of candidates) {
-      const index = low.findIndex((header) => header === candidate || header.includes(candidate));
-      if (index >= 0) return columns[index];
-    }
-    return "";
-  };
+function normalizeHeaderName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\u200f\u200e]/g, "")
+    .replace(/[_\-\/\\]+/g, " ")
+    .replace(/[^a-z0-9\u0600-\u06ff]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
+function scoreColumn(header, rules) {
+  const h = normalizeHeaderName(header);
+  if (!h) return -9999;
+  let score = -9999;
+  for (const rule of rules) {
+    if (rule.exclude && rule.exclude.some((term) => h.includes(term))) continue;
+    const terms = Array.isArray(rule.terms) ? rule.terms : [rule.terms];
+    const matched = rule.all
+      ? terms.every((term) => h.includes(term))
+      : terms.some((term) => h === term || h.includes(term));
+    if (matched) score = Math.max(score, rule.score || 1);
+  }
+  return score;
+}
+
+function findBestColumn(columns, rules) {
+  let best = "";
+  let bestScore = -9999;
+  for (const column of columns || []) {
+    const score = scoreColumn(column, rules);
+    if (score > bestScore) {
+      bestScore = score;
+      best = column;
+    }
+  }
+  return bestScore > -9999 ? best : "";
+}
+
+function autoMapColumns(columns) {
   return {
-    device: find(["device", "turbine", "wtg", "tag", "unit", "object", "asset", "equipment"]),
-    alarm: find(["alarm", "event", "message", "fault", "code", "description"]),
-    desc: find(["description", "desc", "text", "message", "alarm text", "event text"]),
-    time: find(["time", "date", "timestamp", "activation", "start", "raised", "occurred"])
+    device: findBestColumn(columns, [
+      { terms: ["wtg tag", "wtg", "turbine", "device", "tag", "unit", "object", "asset", "equipment"], score: 30 },
+      { terms: ["name"], score: 5, exclude: ["alarm", "event", "time", "date"] }
+    ]),
+    alarm: findBestColumn(columns, [
+      { terms: ["alarm code", "warning code", "fault code", "event code", "code"], score: 40 },
+      { terms: ["alarm name", "alarm", "event", "fault", "warning"], score: 20, exclude: ["time", "date", "activation", "duration", "days", "now"] },
+      { terms: ["description", "message", "text"], score: 5, exclude: ["time", "date"] }
+    ]),
+    desc: findBestColumn(columns, [
+      { terms: ["alarm description", "event description", "description", "desc", "alarm text", "event text", "message", "text"], score: 30 },
+      { terms: ["alarm name", "event name"], score: 15, exclude: ["time", "date"] }
+    ]),
+    time: findBestColumn(columns, [
+      { terms: ["alarm activation time", "activation time", "active alarm activation time"], score: 100 },
+      { terms: ["activation", "activated", "raised", "start", "occurred", "occurrence"], score: 80, exclude: ["time to now", "duration", "days"] },
+      { terms: ["timestamp", "date time", "datetime", "date"], score: 60, exclude: ["time to now", "duration", "days"] },
+      { terms: ["time"], score: 20, exclude: ["time to now", "duration", "days", "now"] }
+    ])
   };
 }
 
@@ -170,6 +214,15 @@ function parseDateTimeFlexible(value) {
   if (!text) return null;
   text = text.replace(/[\u200f\u200e]/g, "");
 
+  // Excel sometimes sends dates as serial numbers. Convert common serial range before trying Date.parse.
+  const numericText = text.replace(/,/g, "");
+  if (/^-?\d+(?:\.\d+)?$/.test(numericText)) {
+    const serial = Number(numericText);
+    if (serial > 20000 && serial < 100000) {
+      return new Date((serial - 25569) * 86400 * 1000);
+    }
+  }
+
   let date = new Date(text);
   if (!Number.isNaN(date.getTime())) return date;
 
@@ -218,12 +271,73 @@ function formatDuration(ms) {
   return `${two(hours)}:${two(minutes)}:${two(seconds)}`;
 }
 
+function parseNumberFlexible(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value).trim().replace(/,/g, ".");
+  const match = text.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const number = Number(match[0]);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseDurationToHours(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value).trim();
+  if (!text) return null;
+
+  const hms = text.match(/^(\d+):(\d{1,2})(?::(\d{1,2}))?$/);
+  if (hms) {
+    const hours = Number(hms[1]);
+    const minutes = Number(hms[2] || 0);
+    const seconds = Number(hms[3] || 0);
+    return hours + minutes / 60 + seconds / 3600;
+  }
+
+  const daysMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:d|day|days)/i);
+  const hoursMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:h|hour|hours)/i);
+  if (daysMatch || hoursMatch) {
+    return (daysMatch ? Number(daysMatch[1]) * 24 : 0) + (hoursMatch ? Number(hoursMatch[1]) : 0);
+  }
+
+  return parseNumberFlexible(text);
+}
+
+function formatDurationFromHours(hours) {
+  if (hours == null || !Number.isFinite(hours) || hours < 0) return "";
+  return formatDuration(hours * 60 * 60 * 1000);
+}
+
 function buildLubricationRowsFromToday(rowsToday, selectedToday) {
   const result = [];
   if (!rowsToday || !rowsToday.length) return result;
 
+  const sourceColumns = Object.keys(rowsToday[0] || {});
   const descColumn = selectedToday.desc;
-  const timeColumn = selectedToday.time;
+
+  // Prefer the real activation/start time. Do not accidentally use "Alarm Time to Now" as activation time.
+  const preferredActivationColumn = findBestColumn(sourceColumns, [
+    { terms: ["alarm activation time", "activation time", "active alarm activation time"], score: 100 },
+    { terms: ["activation", "activated", "raised", "start", "occurred", "occurrence"], score: 80, exclude: ["time to now", "duration", "days", "now"] },
+    { terms: ["timestamp", "date time", "datetime", "date"], score: 60, exclude: ["time to now", "duration", "days", "now"] }
+  ]);
+  const selectedTimeLooksLikeDuration = selectedToday.time && scoreColumn(selectedToday.time, [
+    { terms: ["time to now", "duration", "days", "now"], score: 10 }
+  ]) > -9999;
+  const timeColumn = preferredActivationColumn || (!selectedTimeLooksLikeDuration ? selectedToday.time : "");
+
+  const durationColumn = findBestColumn(sourceColumns, [
+    { terms: ["alarm time to now", "time to now"], score: 100 },
+    { terms: ["alarm duration", "duration"], score: 80 },
+    { terms: ["elapsed"], score: 50 }
+  ]);
+
+  const daysColumn = findBestColumn(sourceColumns, [
+    { terms: ["days"], score: 100 },
+    { terms: ["day"], score: 70 }
+  ]);
+
   const now = new Date();
 
   for (const row of rowsToday) {
@@ -235,9 +349,20 @@ function buildLubricationRowsFromToday(rowsToday, selectedToday) {
 
     const activationRaw = timeColumn ? row[timeColumn] : "";
     const activationString = activationRaw == null ? "" : String(activationRaw).trim();
-    let durationString = "";
-    let daysString = "";
+    let durationString = durationColumn ? String(row[durationColumn] ?? "").trim() : "";
+    let daysString = daysColumn ? String(row[daysColumn] ?? "").trim() : "";
     let durationHours = 0;
+
+    const sourceDays = parseNumberFlexible(daysString);
+    if (sourceDays != null) durationHours = sourceDays * 24;
+
+    if (!durationHours && durationString) {
+      const parsedDurationHours = parseDurationToHours(durationString);
+      if (parsedDurationHours != null && Number.isFinite(parsedDurationHours)) {
+        durationHours = parsedDurationHours;
+        if (!daysString) daysString = (parsedDurationHours / 24).toFixed(1);
+      }
+    }
 
     if (timeColumn && activationString) {
       const activationDate = parseDateTimeFlexible(activationString);
@@ -251,6 +376,9 @@ function buildLubricationRowsFromToday(rowsToday, selectedToday) {
         }
       }
     }
+
+    if (!durationString && durationHours) durationString = formatDurationFromHours(durationHours);
+    if (!daysString && durationHours) daysString = (durationHours / 24).toFixed(1);
 
     result.push({
       device: String(deviceValue).trim(),
