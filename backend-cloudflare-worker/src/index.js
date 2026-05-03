@@ -1,7 +1,7 @@
 import * as XLSX from "xlsx";
 
 const MAX_PREVIEW_ROWS = 25;
-const MAX_RETURN_ROWS = 0; // Keep 0 for phase 1: parse/validate only, do not return full private data.
+const MAX_RETURN_ROWS = 0; // parse/validate endpoint: do not return full source rows.
 
 function jsonResponse(request, env, body, status = 200) {
   return new Response(JSON.stringify(body, null, 2), {
@@ -47,7 +47,7 @@ function normaliseRows(rows) {
   });
 }
 
-async function parseSpreadsheetFile(file, label) {
+async function parseSpreadsheetFile(file, label, returnRows = false) {
   if (!file || typeof file.arrayBuffer !== "function") {
     throw new Error(`${label} is not a valid uploaded file.`);
   }
@@ -70,7 +70,7 @@ async function parseSpreadsheetFile(file, label) {
     defval: "",
     raw: false
   });
-  const rows = normaliseRows(rawRows);
+  const rows = normaliseRows(rawRows).filter((row) => Object.values(row).some((value) => value !== null && value !== ""));
   const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
 
   return {
@@ -82,7 +82,342 @@ async function parseSpreadsheetFile(file, label) {
     rowsCount: rows.length,
     columns,
     preview: rows.slice(0, MAX_PREVIEW_ROWS),
-    data: MAX_RETURN_ROWS > 0 ? rows.slice(0, MAX_RETURN_ROWS) : undefined
+    rows: returnRows ? rows : undefined,
+    data: !returnRows && MAX_RETURN_ROWS > 0 ? rows.slice(0, MAX_RETURN_ROWS) : undefined
+  };
+}
+
+function normalizeValue(value) {
+  return value == null ? "" : String(value).trim().toUpperCase();
+}
+
+function autoMapColumns(columns) {
+  const low = columns.map((column) => String(column).toLowerCase());
+  const find = (candidates) => {
+    for (const candidate of candidates) {
+      const index = low.findIndex((header) => header === candidate || header.includes(candidate));
+      if (index >= 0) return columns[index];
+    }
+    return "";
+  };
+
+  return {
+    device: find(["device", "turbine", "wtg", "tag", "unit", "object", "asset", "equipment"]),
+    alarm: find(["alarm", "event", "message", "fault", "code", "description"]),
+    desc: find(["description", "desc", "text", "message", "alarm text", "event text"]),
+    time: find(["time", "date", "timestamp", "activation", "start", "raised", "occurred"])
+  };
+}
+
+function buildKey(row, columns, includeTime, normalize) {
+  const device = row[columns.device];
+  const alarm = row[columns.alarm];
+  if (device == null || alarm == null) return "";
+  const dev = normalize ? normalizeValue(device) : String(device).trim();
+  const alc = normalize ? normalizeValue(alarm) : String(alarm).trim();
+  let key = `${dev}||${alc}`;
+  if (includeTime && columns.time && row[columns.time]) {
+    const time = normalize ? normalizeValue(row[columns.time]) : String(row[columns.time]).trim();
+    key += `||${time}`;
+  }
+  return key;
+}
+
+function indexBy(rows, columns, includeTime, normalize) {
+  const map = new Map();
+  for (const row of rows) {
+    const key = buildKey(row, columns, includeTime, normalize);
+    if (!key) continue;
+    const object = map.get(key) || { count: 0, row };
+    object.count += 1;
+    map.set(key, object);
+  }
+  return map;
+}
+
+function groupResultsByAlarm(inputArray) {
+  const groupedMap = new Map();
+
+  for (const row of inputArray) {
+    const { alarm, device, description } = row;
+    let entry = groupedMap.get(alarm);
+    if (!entry) {
+      entry = {
+        alarm,
+        description: description || "",
+        devicesList: []
+      };
+      groupedMap.set(alarm, entry);
+    }
+    if (device) entry.devicesList.push(device);
+  }
+
+  const outputArray = [];
+  for (const entry of groupedMap.values()) {
+    entry.devices = entry.devicesList
+      .sort((a, b) => String(a).localeCompare(String(b), "ar"))
+      .join(", ");
+    delete entry.devicesList;
+    outputArray.push(entry);
+  }
+
+  return outputArray.sort((a, b) => String(a.alarm).localeCompare(String(b.alarm), "ar"));
+}
+
+function parseDateTimeFlexible(value) {
+  if (value == null) return null;
+  let text = String(value).trim();
+  if (!text) return null;
+  text = text.replace(/[\u200f\u200e]/g, "");
+
+  let date = new Date(text);
+  if (!Number.isNaN(date.getTime())) return date;
+
+  let match = text.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (match) {
+    let day = parseInt(match[1], 10);
+    let month = parseInt(match[2], 10) - 1;
+    let year = parseInt(match[3], 10);
+    if (year < 100) year += 2000;
+    let hour = parseInt(match[4], 10);
+    const minute = parseInt(match[5], 10);
+    const second = match[6] ? parseInt(match[6], 10) : 0;
+    const ampm = match[7] ? match[7].toUpperCase() : "";
+    if (ampm === "PM" && hour < 12) hour += 12;
+    if (ampm === "AM" && hour === 12) hour = 0;
+    return new Date(year, month, day, hour, minute, second);
+  }
+
+  match = text.match(/^(\d{1,2})[\/-]([A-Za-z]{3})[\/-](\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (match) {
+    const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+    let day = parseInt(match[1], 10);
+    const month = monthNames.indexOf(match[2].toUpperCase());
+    let year = parseInt(match[3], 10);
+    if (year < 100) year += 2000;
+    let hour = parseInt(match[4], 10);
+    const minute = parseInt(match[5], 10);
+    const second = match[6] ? parseInt(match[6], 10) : 0;
+    const ampm = match[7] ? match[7].toUpperCase() : "";
+    if (ampm === "PM" && hour < 12) hour += 12;
+    if (ampm === "AM" && hour === 12) hour = 0;
+    if (month >= 0) return new Date(year, month, day, hour, minute, second);
+  }
+
+  return null;
+}
+
+function formatDuration(ms) {
+  if (ms == null || ms < 0) return "";
+  const totalSeconds = Math.floor(ms / 1000);
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  const two = (number) => String(number).padStart(2, "0");
+  return `${two(hours)}:${two(minutes)}:${two(seconds)}`;
+}
+
+function buildLubricationRowsFromToday(rowsToday, selectedToday) {
+  const result = [];
+  if (!rowsToday || !rowsToday.length) return result;
+
+  const descColumn = selectedToday.desc;
+  const timeColumn = selectedToday.time;
+  const now = new Date();
+
+  for (const row of rowsToday) {
+    const deviceValue = row[selectedToday.device] ?? "";
+    const alarmValue = row[selectedToday.alarm] ?? "";
+    const descValue = descColumn ? (row[descColumn] ?? "") : "";
+    const textForSearch = [alarmValue, descValue].join(" ").toLowerCase();
+    if (!textForSearch.includes("lubrication")) continue;
+
+    const activationRaw = timeColumn ? row[timeColumn] : "";
+    const activationString = activationRaw == null ? "" : String(activationRaw).trim();
+    let durationString = "";
+    let daysString = "";
+    let durationHours = 0;
+
+    if (timeColumn && activationString) {
+      const activationDate = parseDateTimeFlexible(activationString);
+      if (activationDate) {
+        const diffMs = now - activationDate;
+        if (diffMs >= 0) {
+          const days = diffMs / (1000 * 60 * 60 * 24);
+          durationString = formatDuration(diffMs);
+          daysString = days.toFixed(1);
+          durationHours = diffMs / (1000 * 60 * 60);
+        }
+      }
+    }
+
+    result.push({
+      device: String(deviceValue).trim(),
+      alarm: String(alarmValue).trim(),
+      activation: activationString,
+      duration: durationString,
+      days: daysString,
+      durationHours
+    });
+  }
+
+  return result.sort((a, b) => (b.durationHours || 0) - (a.durationHours || 0));
+}
+
+function asBoolean(value, defaultValue = false) {
+  if (value == null || value === "") return defaultValue;
+  const text = String(value).trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(text);
+}
+
+function filterActiveRows(rows, statusOnly) {
+  if (!statusOnly) return rows;
+  const keys = Object.keys(rows[0] || {});
+  const statusKey = keys.find((key) => /^(status|state)$/i.test(key));
+  if (!statusKey) return rows;
+  return rows.filter((row) => String(row[statusKey] || "").toUpperCase().includes("ACTIVE"));
+}
+
+function buildAAWComparison({ today, yesterday, daybefore, options }) {
+  const includeTime = !!options.includeTime;
+  const normalize = options.normalize !== false;
+  const statusOnly = !!options.statusOnly;
+
+  const selectedToday = autoMapColumns(today.columns);
+  const selectedYesterday = autoMapColumns(yesterday.columns);
+  const selectedDayBefore = daybefore ? autoMapColumns(daybefore.columns) : { device: "", alarm: "", desc: "", time: "" };
+
+  if (!selectedToday.device || !selectedToday.alarm || !selectedYesterday.device || !selectedYesterday.alarm) {
+    throw new Error("Could not auto-map required AAW columns. Required columns: turbine/device and alarm/event for today and yesterday files.");
+  }
+
+  const rowsToday = filterActiveRows(today.rows || [], statusOnly);
+  const rowsYesterday = filterActiveRows(yesterday.rows || [], statusOnly);
+  const hasDayBefore = !!(daybefore && daybefore.rows && daybefore.rows.length);
+  const rowsDayBefore = hasDayBefore ? filterActiveRows(daybefore.rows || [], statusOnly) : [];
+
+  const selectedD = { ...selectedDayBefore };
+  if (hasDayBefore) {
+    if (!selectedD.device) selectedD.device = selectedYesterday.device;
+    if (!selectedD.alarm) selectedD.alarm = selectedYesterday.alarm;
+    if (!selectedD.desc) selectedD.desc = selectedYesterday.desc;
+    if (!selectedD.time) selectedD.time = selectedYesterday.time;
+  }
+
+  const idxToday = indexBy(rowsToday, selectedToday, includeTime, normalize);
+  const idxYesterday = indexBy(rowsYesterday, selectedYesterday, includeTime, normalize);
+  const idxDayBefore = hasDayBefore ? indexBy(rowsDayBefore, selectedD, includeTime, normalize) : null;
+  const parseKey = (key) => {
+    const [device, alarm, time] = key.split("||");
+    return { device, alarm, time };
+  };
+
+  const repeated = [];
+  const news = [];
+  const cleared = [];
+  const repeated3 = [];
+
+  for (const [key, valueToday] of idxToday.entries()) {
+    if (idxYesterday.has(key)) {
+      const valueYesterday = idxYesterday.get(key);
+      const todayRow = valueToday.row;
+      const yesterdayRow = valueYesterday.row;
+      const description = selectedToday.desc ? (todayRow[selectedToday.desc] || "") : (selectedYesterday.desc ? (yesterdayRow[selectedYesterday.desc] || "") : "");
+      const parsed = parseKey(key);
+      repeated.push({ device: parsed.device, alarm: parsed.alarm, description, count: `${valueToday.count}/${valueYesterday.count}` });
+    } else {
+      const todayRow = valueToday.row;
+      const description = selectedToday.desc ? (todayRow[selectedToday.desc] || "") : "";
+      const parsed = parseKey(key);
+      news.push({ device: parsed.device, alarm: parsed.alarm, description });
+    }
+  }
+
+  for (const [key, valueYesterday] of idxYesterday.entries()) {
+    if (!idxToday.has(key)) {
+      const yesterdayRow = valueYesterday.row;
+      const description = selectedYesterday.desc ? (yesterdayRow[selectedYesterday.desc] || "") : "";
+      const parsed = parseKey(key);
+      cleared.push({ device: parsed.device, alarm: parsed.alarm, description });
+    }
+  }
+
+  if (hasDayBefore) {
+    for (const [key, valueToday] of idxToday.entries()) {
+      if (idxYesterday.has(key) && idxDayBefore.has(key)) {
+        const todayRow = valueToday.row;
+        const parsed = parseKey(key);
+        const description =
+          selectedToday.desc && todayRow[selectedToday.desc] ? todayRow[selectedToday.desc] :
+          selectedYesterday.desc && idxYesterday.get(key).row[selectedYesterday.desc] ? idxYesterday.get(key).row[selectedYesterday.desc] :
+          selectedD.desc && idxDayBefore.get(key).row[selectedD.desc] ? idxDayBefore.get(key).row[selectedD.desc] : "";
+        repeated3.push({ device: parsed.device, alarm: parsed.alarm, description });
+      }
+    }
+  }
+
+  const groupedRepeated = groupResultsByAlarm(repeated);
+  const groupedNews = groupResultsByAlarm(news);
+  const groupedCleared = groupResultsByAlarm(cleared);
+  const groupedRepeated3 = groupResultsByAlarm(repeated3);
+  const repeated3Set = new Set(groupedRepeated3.map((entry) => entry.alarm));
+  const repeated3Pairs = [];
+
+  if (hasDayBefore) {
+    for (const key of idxToday.keys()) {
+      if (idxYesterday.has(key) && idxDayBefore.has(key)) {
+        const parts = key.split("||");
+        if (parts.length >= 2) repeated3Pairs.push(`${parts[0]}||${parts[1]}`);
+      }
+    }
+  }
+
+  const lubricationRows = buildLubricationRowsFromToday(rowsToday, selectedToday);
+
+  return {
+    success: true,
+    module: "AAW",
+    phase: "backend-calculation",
+    storageMode: "temporary-request-memory",
+    persistentStorage: false,
+    note: "AAW files were parsed and compared inside Cloudflare Worker memory for this request only. They are not saved after the response is returned.",
+    receivedAt: new Date().toISOString(),
+    options: { includeTime, normalize, statusOnly },
+    selectedColumns: {
+      today: selectedToday,
+      yesterday: selectedYesterday,
+      daybefore: selectedD
+    },
+    source: {
+      today: { fileName: today.fileName, rowsCount: today.rowsCount, columns: today.columns },
+      yesterday: { fileName: yesterday.fileName, rowsCount: yesterday.rowsCount, columns: yesterday.columns },
+      daybefore: daybefore ? { fileName: daybefore.fileName, rowsCount: daybefore.rowsCount, columns: daybefore.columns } : null
+    },
+    stats: {
+      today: today.rowsCount,
+      yesterday: yesterday.rowsCount,
+      daybefore: daybefore ? daybefore.rowsCount : null,
+      filteredToday: rowsToday.length,
+      filteredYesterday: rowsYesterday.length,
+      filteredDayBefore: hasDayBefore ? rowsDayBefore.length : null,
+      repeated: groupedRepeated.length,
+      news: groupedNews.length,
+      cleared: groupedCleared.length,
+      repeated3: hasDayBefore ? groupedRepeated3.length : null,
+      lubrication: lubricationRows.length
+    },
+    results: {
+      repeated: groupedRepeated.map((row) => ({ ...row, highlight: repeated3Set.has(row.alarm) })),
+      news: groupedNews.map((row) => ({ ...row, highlight: false })),
+      cleared: groupedCleared.map((row) => ({ ...row, highlight: false })),
+      repeated3: groupedRepeated3,
+      lubrication: lubricationRows
+    },
+    highlight: {
+      repeated3Alarms: Array.from(repeated3Set),
+      repeated3Pairs: Array.from(new Set(repeated3Pairs))
+    }
   };
 }
 
@@ -112,7 +447,7 @@ async function handleAAWUpload(request, env) {
 
   const files = {};
   for (const [label, file] of provided) {
-    files[label] = await parseSpreadsheetFile(file, label);
+    files[label] = await parseSpreadsheetFile(file, label, false);
   }
 
   return jsonResponse(request, env, {
@@ -125,6 +460,47 @@ async function handleAAWUpload(request, env) {
     receivedAt: new Date().toISOString(),
     files
   });
+}
+
+async function handleAAWCompare(request, env) {
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "Expected multipart/form-data with today, yesterday, and optional daybefore files."
+    }, 400);
+  }
+
+  const form = await request.formData();
+  const todayFile = form.get("today") || form.get("file");
+  const yesterdayFile = form.get("yesterday");
+  const dayBeforeFile = form.get("daybefore");
+
+  if (!todayFile || typeof todayFile.arrayBuffer !== "function" || !yesterdayFile || typeof yesterdayFile.arrayBuffer !== "function") {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "AAW backend comparison requires today and yesterday files."
+    }, 400);
+  }
+
+  const today = await parseSpreadsheetFile(todayFile, "today", true);
+  const yesterday = await parseSpreadsheetFile(yesterdayFile, "yesterday", true);
+  const daybefore = dayBeforeFile && typeof dayBeforeFile.arrayBuffer === "function"
+    ? await parseSpreadsheetFile(dayBeforeFile, "daybefore", true)
+    : null;
+
+  const payload = buildAAWComparison({
+    today,
+    yesterday,
+    daybefore,
+    options: {
+      includeTime: asBoolean(form.get("includeTime"), false),
+      normalize: asBoolean(form.get("normalize"), true),
+      statusOnly: asBoolean(form.get("statusOnly"), false)
+    }
+  });
+
+  return jsonResponse(request, env, payload);
 }
 
 export default {
@@ -144,13 +520,17 @@ export default {
           success: true,
           service: "WTG AAW Cloudflare Backend",
           status: "ok",
-          endpoints: ["POST /api/aaw/upload"],
+          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare"],
           storageMode: "temporary-request-memory"
         });
       }
 
       if (url.pathname === "/api/aaw/upload" && request.method === "POST") {
         return await handleAAWUpload(request, env);
+      }
+
+      if (url.pathname === "/api/aaw/compare" && request.method === "POST") {
+        return await handleAAWCompare(request, env);
       }
 
       return jsonResponse(request, env, {
