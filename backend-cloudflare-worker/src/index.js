@@ -87,6 +87,183 @@ async function parseSpreadsheetFile(file, label, returnRows = false) {
   };
 }
 
+function stringifyRowsForBrowser(rows) {
+  return (rows || []).map((row) => {
+    const clean = {};
+    for (const [key, value] of Object.entries(row || {})) {
+      clean[String(key).trim()] = value == null ? "" : String(value).trim();
+    }
+    return clean;
+  });
+}
+
+function orderedColumnsFromRows(rows) {
+  const columns = [];
+  const seen = new Set();
+  for (const row of rows || []) {
+    for (const key of Object.keys(row || {})) {
+      const cleanKey = String(key).trim();
+      if (!cleanKey || seen.has(cleanKey)) continue;
+      seen.add(cleanKey);
+      columns.push(cleanKey);
+    }
+  }
+  return columns;
+}
+
+async function parseGenericTableFile(file, label) {
+  if (!file || typeof file.arrayBuffer !== "function") {
+    throw new Error(`${label} is not a valid uploaded file.`);
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(arrayBuffer);
+  const fileName = file.name || label;
+  const lowerName = fileName.toLowerCase();
+  let workbook;
+
+  if (lowerName.endsWith(".csv") || lowerName.endsWith(".txt")) {
+    const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
+    workbook = XLSX.read(text, { type: "string", cellDates: false, raw: false });
+  } else {
+    workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
+  }
+
+  if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+    throw new Error(`${label} file does not contain any sheets.`);
+  }
+
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+  const rows = stringifyRowsForBrowser(rawRows).filter((row) => Object.values(row).some((value) => String(value || "").trim() !== ""));
+  const columns = orderedColumnsFromRows(rows);
+
+  return {
+    label,
+    fileName,
+    fileType: file.type || "unknown",
+    fileSizeBytes: file.size || bytes.byteLength,
+    sheetName,
+    rowsCount: rows.length,
+    columns,
+    header: columns,
+    data: rows,
+    preview: rows.slice(0, MAX_PREVIEW_ROWS)
+  };
+}
+
+function autoMapAWSColumns(columns) {
+  return {
+    device: findBestColumn(columns, [
+      { terms: ["device", "wtg", "turbine", "device wtg", "اسم التوربينة", "التربينة"], score: 50 },
+      { terms: ["asset", "unit", "tag", "object", "equipment"], score: 20 }
+    ]),
+    event: findBestColumn(columns, [
+      { terms: ["event name", "alarm name", "event", "alarm", "fault", "warning", "اسم الإنذار"], score: 50 },
+      { terms: ["subevent", "categorization", "categorisation"], score: 25 }
+    ]),
+    category: findBestColumn(columns, [
+      { terms: ["category", "categorization", "categorisation", "category event", "الفئة", "توصيف"], score: 50 },
+      { terms: ["type", "state"], score: 10 }
+    ]),
+    duration: findBestColumn(columns, [
+      { terms: ["duration", "total duration", "duration hh mm ss", "مدة"], score: 50 },
+      { terms: ["time"], score: 5, exclude: ["start", "end", "date"] }
+    ]),
+    start: findBestColumn(columns, [
+      { terms: ["start date", "start time", "start", "event start", "بداية الحدث", "تاريخ البداية"], score: 50 }
+    ]),
+    end: findBestColumn(columns, [
+      { terms: ["end date", "end time", "end", "event end", "نهاية الحدث", "تاريخ النهاية"], score: 50 }
+    ]),
+    subevent: findBestColumn(columns, [
+      { terms: ["subevent", "subevent categorization", "subevent / categorization", "categorization description", "categorisation description"], score: 50 }
+    ])
+  };
+}
+
+function classifyAWSCategory(row, colMap) {
+  const categoryKey = colMap.category;
+  const subeventKey = colMap.subevent;
+  const raw = categoryKey ? String(row[categoryKey] || "").trim() : "";
+  const hasSub = !!(subeventKey && String(row[subeventKey] || "").trim());
+  if (hasSub) return "Other";
+  if (!raw || raw.toLowerCase() === "unknown" || raw === "غير معروف" || raw === "بدون فئة") return "Other";
+  const lc = raw.toLowerCase();
+  if (lc.includes("alarm") || raw === "إنذار") return "Alarm";
+  if (lc.includes("state") || raw === "حالة") return "State";
+  if (lc.includes("warning") || raw === "تحذير") return "Warning";
+  return "Other";
+}
+
+function summarizeAWSRows(rows, colMap) {
+  const categories = { Alarm: 0, State: 0, Warning: 0, Other: 0 };
+  const devices = new Set();
+  const events = new Set();
+  for (const row of rows || []) {
+    const cat = classifyAWSCategory(row, colMap);
+    categories[cat] = (categories[cat] || 0) + 1;
+    if (colMap.device && row[colMap.device]) devices.add(String(row[colMap.device]).trim());
+    const eventValue = colMap.event && row[colMap.event] ? String(row[colMap.event]).trim() : "";
+    if (eventValue) events.add(eventValue);
+  }
+  return {
+    totalRows: rows.length,
+    categories,
+    devicesCount: devices.size,
+    eventsCount: events.size
+  };
+}
+
+async function handleAWSUpload(request, env) {
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().includes("multipart/form-data")) {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "Expected multipart/form-data with an AWS file."
+    }, 400);
+  }
+
+  const form = await request.formData();
+  const file = form.get("file") || form.get("aws");
+  if (!file || typeof file.arrayBuffer !== "function") {
+    return jsonResponse(request, env, {
+      success: false,
+      message: "No valid AWS file was uploaded. Send a file field named file or aws."
+    }, 400);
+  }
+
+  const parsed = await parseGenericTableFile(file, "aws");
+  const selectedColumns = autoMapAWSColumns(parsed.columns);
+  const summary = summarizeAWSRows(parsed.data, selectedColumns);
+
+  return jsonResponse(request, env, {
+    success: true,
+    module: "AWS",
+    phase: "backend-upload-parse",
+    storageMode: "temporary-request-memory",
+    persistentStorage: false,
+    note: "AWS file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
+    receivedAt: new Date().toISOString(),
+    file: {
+      fileName: parsed.fileName,
+      fileType: parsed.fileType,
+      fileSizeBytes: parsed.fileSizeBytes,
+      sheetName: parsed.sheetName,
+      rowsCount: parsed.rowsCount,
+      columns: parsed.columns,
+      preview: parsed.preview
+    },
+    parsed: {
+      header: parsed.header,
+      data: parsed.data
+    },
+    selectedColumns,
+    summary
+  });
+}
+
 function normalizeValue(value) {
   return value == null ? "" : String(value).trim().toUpperCase();
 }
@@ -648,7 +825,7 @@ export default {
           success: true,
           service: "WTG AAW Cloudflare Backend",
           status: "ok",
-          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare"],
+          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare", "POST /api/aws/upload"],
           storageMode: "temporary-request-memory"
         });
       }
@@ -659,6 +836,10 @@ export default {
 
       if (url.pathname === "/api/aaw/compare" && request.method === "POST") {
         return await handleAAWCompare(request, env);
+      }
+
+      if (url.pathname === "/api/aws/upload" && request.method === "POST") {
+        return await handleAWSUpload(request, env);
       }
 
       return jsonResponse(request, env, {
