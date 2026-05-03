@@ -3854,9 +3854,7 @@ function updateAawIgnoreHint() {
               const turbineInput = document.getElementById('turbineSearch');
               if (turbineInput) turbineInput.value = '';
               if (typeof populateTurbineList === 'function') populateTurbineList();
-              if (typeof applyFilters === 'function') applyFilters();
-              if (typeof buildTable === 'function') buildTable();
-              if (typeof updateChart === 'function') updateChart();
+              if (typeof applyFilters === 'function') applyFilters(); // Speed Phase 1: applyFilters already rebuilds the table and schedules charts.
             } catch (err) {
               console.error(err);
             }
@@ -3876,9 +3874,7 @@ function updateAawIgnoreHint() {
               const turbineInput = document.getElementById('turbineSearch');
               if (turbineInput) turbineInput.value = '';
               if (typeof populateTurbineList === 'function') populateTurbineList();
-              if (typeof applyFilters === 'function') applyFilters();
-              if (typeof buildTable === 'function') buildTable();
-              if (typeof updateChart === 'function') updateChart();
+              if (typeof applyFilters === 'function') applyFilters(); // Speed Phase 1: applyFilters already rebuilds the table and schedules charts.
             } catch (err) {
               console.error(err);
             }
@@ -3912,9 +3908,7 @@ function updateAawIgnoreHint() {
             const turbineInput = document.getElementById('turbineSearch');
             if (turbineInput) turbineInput.value = '';
             if (typeof populateTurbineList === 'function') populateTurbineList();
-            if (typeof applyFilters === 'function') applyFilters();
-            if (typeof buildTable === 'function') buildTable();
-            if (typeof updateChart === 'function') updateChart();
+            if (typeof applyFilters === 'function') applyFilters(); // Speed Phase 1: avoid duplicate table/chart renders.
             return { matched: matches, count: matches.length };
           } catch (err) {
             return { matched: [], count: 0, error: String(err && err.message || err) };
@@ -4567,9 +4561,7 @@ function updateAawIgnoreHint() {
             else if (mode === 'none') selectedVars = new Set();
             else selectedVars = new Set((labels || []).filter(Boolean));
             if (typeof populateVariableList === 'function') populateVariableList();
-            if (typeof applyFilters === 'function') applyFilters();
-            if (typeof buildTable === 'function') buildTable();
-            if (typeof updateChart === 'function') updateChart();
+            if (typeof applyFilters === 'function') applyFilters(); // Speed Phase 1: avoid duplicate table/chart renders.
             if (typeof window.__bridgeApplyXminNoneMode === 'function') window.__bridgeApplyXminNoneMode(mode === 'none');
           } catch (err) {
             console.error(err);
@@ -5757,8 +5749,7 @@ function bindUnifiedInputs() {
       + "}); } "
       + "if (typeof populateVariableList === 'function') populateVariableList(); "
       + "if (typeof applyFilters === 'function') applyFilters(); "
-      + "if (typeof buildTable === 'function') buildTable(); "
-      + "if (typeof updateChart === 'function') updateChart(); "
+      + "/* Speed Phase 1: applyFilters already updates table/chart. */ "
       + "if (typeof window.__renderUnifiedIgnoredTempOverviewMaybe === 'function') window.__renderUnifiedIgnoredTempOverviewMaybe(); "
       + "if (typeof window.__bridgeApplyXminNoneMode === 'function') window.__bridgeApplyXminNoneMode(mode === 'none'); "
       + '} catch (err) { console.error(err); }})(' + payloadMode + ', ' + payloadLabels + ')');
@@ -10202,3 +10193,215 @@ function bindUnifiedInputs() {
 })();
 
 ;
+
+/* ===== Speed Phase 1: cached filtering + deferred chart render ===== */
+(function(){
+  const SPEED_PATCH_ID = 'wtg-speed-phase1-xmin-patch';
+  const XMIN_SPEED_PATCH = String.raw`(function(){
+    if (window.__wtgSpeedPhase1Installed) return true;
+    window.__wtgSpeedPhase1Installed = true;
+
+    function safeEval(expr, fallback){
+      try { return eval(expr); } catch (err) { return fallback; }
+    }
+    function arrFromSet(value){
+      try { return Array.from(value || []).map(function(v){ return String(v || '').trim(); }).filter(Boolean).sort(); }
+      catch (err) { return []; }
+    }
+    function dateKey(value){
+      if (!value) return '';
+      try {
+        if (value instanceof Date) return isNaN(value.getTime()) ? '' : String(value.getTime());
+        if (typeof value.getTime === 'function') return String(value.getTime());
+      } catch (err) {}
+      return String(value || '');
+    }
+    function rawSignature(){
+      var raw = safeEval('rawData', []);
+      if (!Array.isArray(raw) || !raw.length) return '0';
+      var first = raw[0] || {};
+      var last = raw[raw.length - 1] || {};
+      return [raw.length, first.Date || '', first.Device || '', last.Date || '', last.Device || ''].join('~');
+    }
+    function filterKey(){
+      return JSON.stringify({
+        raw: rawSignature(),
+        interval: safeEval('intervalMinutes', ''),
+        turbineFilter: safeEval('turbineFilter', ''),
+        selectedTurbines: arrFromSet(safeEval('selectedTurbines', null)),
+        start: dateKey(safeEval('startDateFilter', null)),
+        end: dateKey(safeEval('endDateFilter', null))
+      });
+    }
+    function tableKey(){
+      var sort = safeEval('currentSort', null) || {};
+      return JSON.stringify({
+        rows: (safeEval('displayData', []) || []).length,
+        page: safeEval('currentPage', 1),
+        rowsPerPage: safeEval('rowsPerPage', 50),
+        selectedVars: arrFromSet(safeEval('selectedVars', null)),
+        sortColumn: sort.column || '',
+        sortAsc: sort.asc !== false,
+        none: !!window.__bridgeXminNoneMode
+      });
+    }
+    function ensureSpeedNote(){
+      var tableContainer = document.getElementById('tableContainer') || document.getElementById('main') || document.body;
+      if (!tableContainer) return null;
+      var note = document.getElementById('wtgXminSpeedNote');
+      if (!note) {
+        note = document.createElement('div');
+        note.id = 'wtgXminSpeedNote';
+        note.style.cssText = 'display:none;margin:8px 0 10px;padding:8px 10px;border:1px solid #dbeafe;border-radius:10px;background:#eff6ff;color:#1e40af;font-size:12px;line-height:1.45;';
+        tableContainer.parentNode ? tableContainer.parentNode.insertBefore(note, tableContainer) : document.body.appendChild(note);
+      }
+      return note;
+    }
+    function setSpeedNote(text){
+      var note = ensureSpeedNote();
+      if (!note) return;
+      note.textContent = text;
+      note.style.display = '';
+      clearTimeout(note.__hideTimer);
+      note.__hideTimer = setTimeout(function(){ note.style.display = 'none'; }, 2600);
+    }
+    function runAfterRenderHooks(){
+      try { if (typeof window.__renderUnifiedIgnoredExceedancesMaybe === 'function') window.__renderUnifiedIgnoredExceedancesMaybe(); } catch (e) {}
+      try { if (typeof window.__renderUnifiedIgnoredTempOverviewMaybe === 'function') window.__renderUnifiedIgnoredTempOverviewMaybe(); } catch (e) {}
+      try { if (typeof window.__renderUnifiedIgnoredDeviationMaybe === 'function') window.__renderUnifiedIgnoredDeviationMaybe(); } catch (e) {}
+      try { if (typeof updatePaginationControls === 'function') updatePaginationControls(); } catch (e) {}
+    }
+
+    if (typeof updateChart === 'function' && !updateChart.__wtgSpeedPhase1Deferred) {
+      var originalUpdateChart = updateChart;
+      var chartTimer = null;
+      var lastThis = null;
+      var lastArgs = null;
+      var patchedUpdateChart = function(){
+        lastThis = this;
+        lastArgs = arguments;
+        clearTimeout(chartTimer);
+        chartTimer = setTimeout(function(){
+          try { originalUpdateChart.apply(lastThis, lastArgs); }
+          catch (err) { console.error('Speed Phase 1 deferred chart failed:', err); }
+        }, 90);
+      };
+      patchedUpdateChart.__wtgSpeedPhase1Deferred = true;
+      try { updateChart = patchedUpdateChart; } catch (e) {}
+      window.updateChart = patchedUpdateChart;
+    }
+
+    if (typeof buildTable === 'function' && !buildTable.__wtgSpeedPhase1Coalesced) {
+      var originalBuildTable = buildTable;
+      var lastTableKey = '';
+      var lastBuildAt = 0;
+      var patchedBuildTable = function(){
+        var key = tableKey();
+        var now = (performance && performance.now) ? performance.now() : Date.now();
+        if (key === lastTableKey && (now - lastBuildAt) < 160 && !window.__forceXminBuildTable) {
+          window.__wtgSpeedPhase1Stats = window.__wtgSpeedPhase1Stats || {};
+          window.__wtgSpeedPhase1Stats.skippedDuplicateTableRenders = (window.__wtgSpeedPhase1Stats.skippedDuplicateTableRenders || 0) + 1;
+          return;
+        }
+        lastTableKey = key;
+        lastBuildAt = now;
+        return originalBuildTable.apply(this, arguments);
+      };
+      patchedBuildTable.__wtgSpeedPhase1Coalesced = true;
+      try { buildTable = patchedBuildTable; } catch (e) {}
+      window.buildTable = patchedBuildTable;
+    }
+
+    if (typeof applyFilters === 'function' && !applyFilters.__wtgSpeedPhase1Cached) {
+      var originalApplyFilters = applyFilters;
+      var cache = new Map();
+      var order = [];
+      var MAX_CACHE = 8;
+      function remember(key){
+        if (!cache.has(key)) order.push(key);
+        while (order.length > MAX_CACHE) {
+          var old = order.shift();
+          cache.delete(old);
+        }
+      }
+      var patchedApplyFilters = function(){
+        if (window.__bridgeXminNoneMode) {
+          try { filteredData = []; displayData = []; currentPage = 1; } catch (e) {}
+          try { if (typeof buildTable === 'function') buildTable(); } catch (e) {}
+          runAfterRenderHooks();
+          return;
+        }
+        var raw = safeEval('rawData', []);
+        if (!Array.isArray(raw) || !raw.length) return originalApplyFilters.apply(this, arguments);
+        var key = filterKey();
+        var start = (performance && performance.now) ? performance.now() : Date.now();
+        if (cache.has(key)) {
+          var hit = cache.get(key);
+          try {
+            filteredData = hit.filteredData;
+            displayData = hit.displayData;
+            currentPage = 1;
+            if (typeof buildTable === 'function') buildTable();
+            runAfterRenderHooks();
+            var elapsedHit = Math.round(((performance && performance.now) ? performance.now() : Date.now()) - start);
+            window.__wtgSpeedPhase1Stats = Object.assign(window.__wtgSpeedPhase1Stats || {}, { lastFilterSource:'cache', lastFilterMs:elapsedHit, cachedKeys:cache.size });
+            setSpeedNote('Fast filter: reused cached X-Minute result in ' + elapsedHit + ' ms.');
+            return;
+          } catch (err) {
+            console.warn('Speed Phase 1 cache hit failed; falling back to original filter.', err);
+          }
+        }
+        var result = originalApplyFilters.apply(this, arguments);
+        try {
+          cache.set(key, {
+            filteredData: safeEval('filteredData', []),
+            displayData: safeEval('displayData', [])
+          });
+          remember(key);
+          var elapsed = Math.round(((performance && performance.now) ? performance.now() : Date.now()) - start);
+          window.__wtgSpeedPhase1Stats = Object.assign(window.__wtgSpeedPhase1Stats || {}, { lastFilterSource:'computed', lastFilterMs:elapsed, cachedKeys:cache.size });
+          setSpeedNote('Filter calculated once and cached in ' + elapsed + ' ms. Repeating the same filter will be faster.');
+        } catch (err) {}
+        return result;
+      };
+      patchedApplyFilters.__wtgSpeedPhase1Cached = true;
+      try { applyFilters = patchedApplyFilters; } catch (e) {}
+      window.applyFilters = patchedApplyFilters;
+      window.__clearXMinSpeedCache = function(){ cache.clear(); order = []; setSpeedNote('X-Minute filter cache cleared.'); };
+    }
+
+    return true;
+  })();`;
+
+  function injectXminSpeedPatch(){
+    try {
+      const frame = document.getElementById('frame-xmin');
+      if (!frame) return false;
+      const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+      if (!doc || !doc.body) return false;
+      if (doc.getElementById(SPEED_PATCH_ID)) {
+        try { return !!frame.contentWindow.eval('(function(){ return !!window.__wtgSpeedPhase1Installed; })()'); } catch (e) { return true; }
+      }
+      const script = doc.createElement('script');
+      script.id = SPEED_PATCH_ID;
+      script.textContent = XMIN_SPEED_PATCH;
+      doc.body.appendChild(script);
+      return true;
+    } catch (err) {
+      console.warn('Speed Phase 1 patch skipped:', err);
+      return false;
+    }
+  }
+
+  function scheduleSpeedPatch(){
+    [120, 500, 1200, 2500].forEach(delay => setTimeout(injectXminSpeedPatch, delay));
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scheduleSpeedPatch);
+  else scheduleSpeedPatch();
+
+  const xminFrame = document.getElementById('frame-xmin');
+  if (xminFrame) xminFrame.addEventListener('load', scheduleSpeedPatch);
+
+  window.__installXMinSpeedPatch = injectXminSpeedPatch;
+})();
