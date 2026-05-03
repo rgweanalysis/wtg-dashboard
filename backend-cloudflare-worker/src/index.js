@@ -331,8 +331,10 @@ function isAWSWarning903(row, colMap) {
 }
 
 function buildAWSEmergencyIncidents(rows, colMap) {
-  const MERGE_GAP_MS = 5 * 60 * 1000;
-  const intervals = [];
+  // Count every Windturbine EMERGENCY source row as a separate incident.
+  // This matches the business expectation that repeated emergency entries for the same turbine
+  // are counted as repeated incidents instead of being merged into one long interval.
+  const incidents = [];
   for (const row of rows || []) {
     const category = classifyAWSCategory(row, colMap);
     const eventName = getAWSEventName(row, colMap);
@@ -340,20 +342,9 @@ function buildAWSEmergencyIncidents(rows, colMap) {
     if (!/windturbine/i.test(eventName) || !/(^|\b)emergency(\b|$)/i.test(eventName)) continue;
     const bounds = getAWSRowBounds(row, colMap);
     if (!bounds.start) continue;
-    intervals.push({ start: bounds.start, end: bounds.end || bounds.start });
+    incidents.push({ start: bounds.start, end: bounds.end || bounds.start });
   }
-  intervals.sort((a, b) => a.start - b.start);
-  const merged = [];
-  for (const item of intervals) {
-    if (!merged.length) { merged.push({ ...item }); continue; }
-    const last = merged[merged.length - 1];
-    if (item.start.getTime() <= last.end.getTime() + MERGE_GAP_MS) {
-      if (item.end.getTime() > last.end.getTime()) last.end = item.end;
-    } else {
-      merged.push({ ...item });
-    }
-  }
-  return merged;
+  return incidents.sort((a, b) => a.start - b.start);
 }
 
 function medianNumber(values) {
@@ -467,7 +458,7 @@ function buildAWSBackendAnalysis(rows, colMap) {
     }
     const gaps = [];
     for (let i = 1; i < incidents.length; i += 1) {
-      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].end.getTime()) / 60000);
+      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].start.getTime()) / 60000);
       gaps.push(minutes);
       allEmergencyIntervals.push(minutes);
     }
