@@ -611,6 +611,228 @@ async function parseXMinTextFile(file, label = "xmin") {
   };
 }
 
+
+function parseXMinNumber(value) {
+  if (value == null) return NaN;
+  let text = String(value).trim().replace(/\u00a0/g, "").replace(/\s+/g, "");
+  if (!text) return NaN;
+  const commaCount = (text.match(/,/g) || []).length;
+  const dotCount = (text.match(/\./g) || []).length;
+  if (commaCount > dotCount) {
+    text = text.replace(/\./g, "").replace(/,/g, ".");
+  } else {
+    text = text.replace(/,/g, "");
+  }
+  const n = Number(text);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function parseXMinDateMs(value) {
+  const text = String(value == null ? "" : value).trim().replace("T", " ");
+  if (!text) return NaN;
+  const direct = Date.parse(text);
+  if (Number.isFinite(direct)) return direct;
+  const parts = text.split(/\s+/);
+  const datePart = parts[0] || "";
+  const timePart = parts[1] || "00:00:00";
+  const d = datePart.split(/[\/\-]/).map((x) => parseInt(x, 10));
+  const t = timePart.split(":");
+  if (d.length < 3 || d.some((x) => !Number.isFinite(x))) return NaN;
+  const secRaw = String(t[2] || "0").replace(",", ".");
+  const secFloat = parseFloat(secRaw);
+  const sec = Number.isFinite(secFloat) ? Math.floor(secFloat) : 0;
+  const ms = Number.isFinite(secFloat) ? Math.round((secFloat - sec) * 1000) : 0;
+  // X-Minute files normally use yyyy/mm/dd or yyyy-mm-dd.
+  return new Date(d[0], (d[1] || 1) - 1, d[2] || 1, parseInt(t[0], 10) || 0, parseInt(t[1], 10) || 0, sec, ms).getTime();
+}
+
+function inferXMinCategoryBackend(variableName) {
+  const lower = String(variableName || "").toLowerCase();
+  if (lower.includes("bearing")) return "Bearing";
+  if (lower.includes("gearbox")) return "Gearbox";
+  if (lower.includes("generator")) return "Generator";
+  if (lower.includes("slipring")) return "Sliprings";
+  if (lower.includes("trafo")) return "Trafo";
+  if (lower.includes("temperature") || lower.includes("temp")) return "Temperature";
+  if (lower.startsWith("average")) return "Average";
+  return "Other";
+}
+
+const XMIN_LIMIT_RULES = [
+  { match: /\bBearing\s+D\.?E\.?\s+Temperature\b.*10\s*M/i, limit: 95, label: "Bearing D.E. Temperature" },
+  { match: /\bBearing\s+N\.?D\.?E\.?\s+Temperature\b.*10\s*M/i, limit: 95, label: "Bearing N.D.E. Temperature" },
+  { match: /\bGearbox\b.*bearing\s+temperature\b.*10\s*M/i, limit: 88, label: "Gearbox bearing temperature" },
+  { match: /\bGearbox\b.*oil\s+temperature\b.*10\s*M/i, limit: 75, label: "Gearbox oil temperature" },
+  { match: /\bGenerator\b.*windings\s+temperature\s*1\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 1" },
+  { match: /\bGenerator\b.*windings\s+temperature\s*2\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 2" },
+  { match: /\bGenerator\b.*windings\s+temperature\s*3\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 3" },
+  { match: /\bGenerator\b.*sliprings\s+temperature\b.*10\s*M/i, limit: 75, label: "Generator sliprings temperature" },
+  { match: /\bTrafo\s*1\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 1 winding temperature" },
+  { match: /\bTrafo\s*2\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 2 winding temperature" },
+  { match: /\bTrafo\s*3\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 3 winding temperature" }
+];
+
+function findXMinLimitRule(variableName) {
+  const text = String(variableName || "").replace(/\s+/g, " ").trim();
+  return XMIN_LIMIT_RULES.find((rule) => rule.match.test(text)) || null;
+}
+
+function roundXMin(value, digits = 3) {
+  if (!Number.isFinite(value)) return null;
+  const factor = Math.pow(10, digits);
+  return Math.round(value * factor) / factor;
+}
+
+function computeXMinAnalysis(parsed) {
+  const rows = Array.isArray(parsed?.rows) ? parsed.rows : [];
+  const variables = Array.isArray(parsed?.variables) ? parsed.variables : [];
+  const devices = Array.isArray(parsed?.devices) ? parsed.devices : [];
+  const categories = {};
+  const deviceMap = new Map();
+  const variableMap = new Map();
+  const limitRules = new Map();
+  let minMs = Infinity;
+  let maxMs = -Infinity;
+  let firstDate = "";
+  let lastDate = "";
+  let exceedanceCount = 0;
+  const affectedDevices = new Set();
+  const affectedVariables = new Set();
+  const exceedanceRows = [];
+
+  for (const variable of variables) {
+    const category = inferXMinCategoryBackend(variable);
+    categories[category] = (categories[category] || 0) + 1;
+    variableMap.set(variable, {
+      variable,
+      category,
+      numericCount: 0,
+      min: Infinity,
+      max: -Infinity,
+      sum: 0,
+      avg: null,
+      maxDevice: "",
+      maxDate: "",
+      exceedanceLimit: null,
+      exceedanceCount: 0
+    });
+    const rule = findXMinLimitRule(variable);
+    if (rule) {
+      limitRules.set(variable, rule);
+      variableMap.get(variable).exceedanceLimit = rule.limit;
+    }
+  }
+
+  for (const row of rows) {
+    const device = String(row.Device || "").trim() || "Unknown";
+    const date = String(row.Date || "").trim();
+    const ms = parseXMinDateMs(date);
+    if (Number.isFinite(ms)) {
+      if (ms < minMs) { minMs = ms; firstDate = date; }
+      if (ms > maxMs) { maxMs = ms; lastDate = date; }
+    }
+    if (!deviceMap.has(device)) {
+      deviceMap.set(device, { device, rowsCount: 0, firstDate: "", lastDate: "", firstMs: Infinity, lastMs: -Infinity, exceedanceCount: 0 });
+    }
+    const devRec = deviceMap.get(device);
+    devRec.rowsCount += 1;
+    if (Number.isFinite(ms)) {
+      if (ms < devRec.firstMs) { devRec.firstMs = ms; devRec.firstDate = date; }
+      if (ms > devRec.lastMs) { devRec.lastMs = ms; devRec.lastDate = date; }
+    }
+
+    for (const variable of variables) {
+      const n = parseXMinNumber(row[variable]);
+      if (!Number.isFinite(n)) continue;
+      const rec = variableMap.get(variable);
+      if (!rec) continue;
+      rec.numericCount += 1;
+      rec.sum += n;
+      if (n < rec.min) rec.min = n;
+      if (n > rec.max) {
+        rec.max = n;
+        rec.maxDevice = device;
+        rec.maxDate = date;
+      }
+      const rule = limitRules.get(variable);
+      if (rule && n > rule.limit) {
+        exceedanceCount += 1;
+        affectedDevices.add(device);
+        affectedVariables.add(variable);
+        rec.exceedanceCount += 1;
+        devRec.exceedanceCount += 1;
+        if (exceedanceRows.length < 1000) {
+          exceedanceRows.push({
+            device,
+            variable,
+            date,
+            value: roundXMin(n, 3),
+            limit: rule.limit,
+            exceedBy: roundXMin(n - rule.limit, 3)
+          });
+        }
+      }
+    }
+  }
+
+  const variableStats = Array.from(variableMap.values()).map((rec) => ({
+    variable: rec.variable,
+    category: rec.category,
+    numericCount: rec.numericCount,
+    min: rec.numericCount ? roundXMin(rec.min, 3) : null,
+    max: rec.numericCount ? roundXMin(rec.max, 3) : null,
+    avg: rec.numericCount ? roundXMin(rec.sum / rec.numericCount, 3) : null,
+    maxDevice: rec.maxDevice,
+    maxDate: rec.maxDate,
+    exceedanceLimit: rec.exceedanceLimit,
+    exceedanceCount: rec.exceedanceCount
+  }));
+
+  const deviceStats = Array.from(deviceMap.values()).map((rec) => ({
+    device: rec.device,
+    rowsCount: rec.rowsCount,
+    firstDate: rec.firstDate,
+    lastDate: rec.lastDate,
+    exceedanceCount: rec.exceedanceCount
+  })).sort((a, b) => b.rowsCount - a.rowsCount || a.device.localeCompare(b.device));
+
+  const temperatureHotspots = variableStats
+    .filter((rec) => /temp|temperature/i.test(rec.variable) && Number.isFinite(rec.max))
+    .sort((a, b) => (b.max ?? -Infinity) - (a.max ?? -Infinity))
+    .slice(0, 50);
+
+  const topExceedanceVariables = variableStats
+    .filter((rec) => rec.exceedanceCount > 0)
+    .sort((a, b) => b.exceedanceCount - a.exceedanceCount || String(a.variable).localeCompare(String(b.variable)))
+    .slice(0, 50);
+
+  exceedanceRows.sort((a, b) => (b.exceedBy || 0) - (a.exceedBy || 0));
+
+  return {
+    phase: "backend-analysis",
+    calculatedAt: new Date().toISOString(),
+    totalRows: rows.length,
+    devicesCount: devices.length,
+    variablesCount: variables.length,
+    dateRange: {
+      first: firstDate,
+      last: lastDate
+    },
+    categories,
+    deviceStats,
+    variableStats,
+    temperatureHotspots,
+    exceedances: {
+      total: exceedanceCount,
+      returnedRows: exceedanceRows.length,
+      affectedDevices: affectedDevices.size,
+      affectedVariables: affectedVariables.size,
+      topVariables: topExceedanceVariables,
+      rows: exceedanceRows
+    }
+  };
+}
+
 async function handleXMinUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
@@ -630,10 +852,11 @@ async function handleXMinUpload(request, env) {
   }
 
   const parsed = await parseXMinTextFile(file, "xmin");
+  const analysis = computeXMinAnalysis(parsed);
   return jsonResponse(request, env, {
     success: true,
     module: "X-Minute",
-    phase: "backend-upload-parse",
+    phase: "backend-upload-parse-and-analysis",
     storageMode: "temporary-request-memory",
     persistentStorage: false,
     note: "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
@@ -655,6 +878,7 @@ async function handleXMinUpload(request, env) {
       devices: parsed.devices,
       data: parsed.rows
     },
+    analysis,
     summary: {
       totalRows: parsed.rowsCount,
       devicesCount: parsed.devices.length,
@@ -689,7 +913,7 @@ async function handleAWSUpload(request, env) {
   return jsonResponse(request, env, {
     success: true,
     module: "AWS",
-    phase: "backend-upload-parse",
+    phase: "backend-upload-parse-and-analysis",
     storageMode: "temporary-request-memory",
     persistentStorage: false,
     note: "AWS file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
