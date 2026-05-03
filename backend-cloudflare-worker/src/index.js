@@ -331,13 +331,8 @@ function isAWSWarning903(row, colMap) {
 }
 
 function buildAWSEmergencyIncidents(rows, colMap) {
-  // Count every AWS row where the turbine entered WindTurbine Emergency.
-  // Do NOT de-duplicate by start timestamp: many exported AWS files store dates
-  // at day precision (00:00), so several emergency occurrences on the same day
-  // can share the same parsed start time. De-duplicating by timestamp collapses
-  // them incorrectly into one incident.
-  const incidents = [];
-  let order = 0;
+  const MERGE_GAP_MS = 5 * 60 * 1000;
+  const intervals = [];
   for (const row of rows || []) {
     const category = classifyAWSCategory(row, colMap);
     const eventName = getAWSEventName(row, colMap);
@@ -345,12 +340,20 @@ function buildAWSEmergencyIncidents(rows, colMap) {
     if (!/windturbine/i.test(eventName) || !/(^|\b)emergency(\b|$)/i.test(eventName)) continue;
     const bounds = getAWSRowBounds(row, colMap);
     if (!bounds.start) continue;
-    const startMs = bounds.start.getTime();
-    if (!Number.isFinite(startMs)) continue;
-    incidents.push({ start: bounds.start, end: bounds.end || bounds.start, eventName, order: order++ });
+    intervals.push({ start: bounds.start, end: bounds.end || bounds.start });
   }
-  incidents.sort((a, b) => (a.start - b.start) || (a.order - b.order));
-  return incidents;
+  intervals.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const item of intervals) {
+    if (!merged.length) { merged.push({ ...item }); continue; }
+    const last = merged[merged.length - 1];
+    if (item.start.getTime() <= last.end.getTime() + MERGE_GAP_MS) {
+      if (item.end.getTime() > last.end.getTime()) last.end = item.end;
+    } else {
+      merged.push({ ...item });
+    }
+  }
+  return merged;
 }
 
 function medianNumber(values) {
@@ -464,9 +467,7 @@ function buildAWSBackendAnalysis(rows, colMap) {
     }
     const gaps = [];
     for (let i = 1; i < incidents.length; i += 1) {
-      // Recurrence gap is measured between emergency start times, not previous end time.
-      // This avoids zero gaps when an AWS state interval spans until the next state change.
-      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].start.getTime()) / 60000);
+      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].end.getTime()) / 60000);
       gaps.push(minutes);
       allEmergencyIntervals.push(minutes);
     }
@@ -487,7 +488,7 @@ function buildAWSBackendAnalysis(rows, colMap) {
   emergencyRows.sort((a, b) => (b.incidentCount - a.incidentCount) || ((a.avgGapMinutes ?? Number.POSITIVE_INFINITY) - (b.avgGapMinutes ?? Number.POSITIVE_INFINITY)) || a.device.localeCompare(b.device));
 
   return {
-    version: "aws-backend-analysis-v3",
+    version: "aws-backend-analysis-v2",
     rowsAnalyzed: Array.isArray(rows) ? rows.length : 0,
     categories: Object.fromEntries(Object.entries(categories).map(([key, value]) => [key, { ...value, durationFormatted: formatAWSDuration(value.durationSeconds) }])),
     datesCount: Array.from(dateKeys).filter(Boolean).length,
