@@ -14,14 +14,18 @@ function jsonResponse(request, env, body, status = 200) {
 }
 
 function corsHeaders(request, env) {
-  // Robust CORS for Cloudflare Pages -> Worker calls.
-  // No credentials/cookies are used by this dashboard, so wildcard is safe here.
+  const requestOrigin = request.headers.get("Origin") || "*";
+  const allowedRaw = env.ALLOWED_ORIGIN || "*";
+  const allowed = allowedRaw.split(",").map((item) => item.trim()).filter(Boolean);
+  const allowOrigin = allowed.includes("*") || allowed.includes(requestOrigin)
+    ? requestOrigin
+    : allowed[0] || "*";
+
   return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
-    "Access-Control-Max-Age": "86400",
-    "Vary": "Origin"
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400"
   };
 }
 
@@ -120,33 +124,9 @@ async function parseGenericTableFile(file, label) {
 
   if (lowerName.endsWith(".csv") || lowerName.endsWith(".txt")) {
     const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
-    const lines = text.split(/\r?\n/).filter((line) => String(line || "").trim() !== "");
-    if (!lines.length) throw new Error(`${label} file is empty.`);
-    const delimiter = detectXMinDelimiter(lines[0]);
-    const columns = splitXMinCsvLine(lines[0], delimiter).map((h, idx) => String(h || `Column ${idx + 1}`).trim()).filter(Boolean);
-    const rows = [];
-    for (const line of lines.slice(1)) {
-      const cells = splitXMinCsvLine(line, delimiter);
-      const row = {};
-      columns.forEach((col, idx) => {
-        row[col] = normalizeXMinCell(cells[idx]);
-      });
-      if (Object.values(row).some((value) => String(value || "").trim() !== "")) rows.push(row);
-    }
-    return {
-      label,
-      fileName,
-      fileType: file.type || "text/csv",
-      fileSizeBytes: file.size || bytes.byteLength,
-      sheetName: "CSV",
-      rowsCount: rows.length,
-      columns,
-      header: columns,
-      data: rows,
-      preview: rows.slice(0, MAX_PREVIEW_ROWS)
-    };
+    workbook = XLSX.read(text, { type: "string", cellDates: false, raw: false });
   } else {
-    workbook = XLSX.read(bytes, { type: "array", cellDates: true, raw: false });
+    workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
   }
 
   if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
@@ -853,250 +833,6 @@ function computeXMinAnalysis(parsed) {
   };
 }
 
-
-function computeXMinAnalysisLiteFromText(text, fileInfo = {}) {
-  const cleanText = String(text || "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = cleanText.split("\n").filter((line) => String(line || "").trim() !== "");
-  if (!lines.length) {
-    return {
-      parsed: {
-        label: fileInfo.label || "xmin",
-        fileName: fileInfo.fileName || "x-minute-file",
-        fileType: fileInfo.fileType || "text/csv",
-        fileSizeBytes: fileInfo.fileSizeBytes || 0,
-        rowsCount: 0,
-        delimiter: ";",
-        columns: [],
-        variables: [],
-        devices: [],
-        preview: []
-      },
-      analysis: {
-        phase: "backend-analysis-lite",
-        calculatedAt: new Date().toISOString(),
-        totalRows: 0,
-        devicesCount: 0,
-        variablesCount: 0,
-        dateRange: { first: "", last: "" },
-        categories: {},
-        deviceStats: [],
-        variableStats: [],
-        temperatureHotspots: [],
-        exceedances: { total: 0, returnedRows: 0, affectedDevices: 0, affectedVariables: 0, topVariables: [], rows: [] }
-      }
-    };
-  }
-
-  const delimiter = detectXMinDelimiter(lines[0]);
-  const headers = splitXMinCsvLine(lines[0], delimiter).map((header, index) => normalizeXMinCell(header) || `Column ${index + 1}`);
-  const deviceIndex = headers.findIndex((h) => normalizeHeaderName(h) === "device" || normalizeHeaderName(h).includes("device"));
-  const dateIndex = headers.findIndex((h) => normalizeHeaderName(h) === "date" || normalizeHeaderName(h).includes("date"));
-  const variableIndexes = [];
-  for (let i = 0; i < headers.length; i += 1) {
-    if (i !== deviceIndex && i !== dateIndex) variableIndexes.push(i);
-  }
-  const variables = variableIndexes.map((i) => headers[i]).filter(Boolean);
-  const categories = {};
-  const devicesSet = new Set();
-  const deviceMap = new Map();
-  const variableMap = new Map();
-  const limitRules = new Map();
-  let minMs = Infinity;
-  let maxMs = -Infinity;
-  let firstDate = "";
-  let lastDate = "";
-  let rowsCount = 0;
-  let exceedanceCount = 0;
-  const affectedDevices = new Set();
-  const affectedVariables = new Set();
-  const exceedanceRows = [];
-  const preview = [];
-
-  for (const variable of variables) {
-    const category = inferXMinCategoryBackend(variable);
-    categories[category] = (categories[category] || 0) + 1;
-    variableMap.set(variable, {
-      variable,
-      category,
-      numericCount: 0,
-      min: Infinity,
-      max: -Infinity,
-      sum: 0,
-      avg: null,
-      maxDevice: "",
-      maxDate: "",
-      exceedanceLimit: null,
-      exceedanceCount: 0
-    });
-    const rule = findXMinLimitRule(variable);
-    if (rule) {
-      limitRules.set(variable, rule);
-      variableMap.get(variable).exceedanceLimit = rule.limit;
-    }
-  }
-
-  for (let lineIndex = 1; lineIndex < lines.length; lineIndex += 1) {
-    const rawLine = lines[lineIndex];
-    if (!String(rawLine || "").trim()) continue;
-    const cells = splitXMinCsvLine(rawLine, delimiter);
-    if (cells.length < Math.max(2, headers.length - 2)) continue;
-    rowsCount += 1;
-    const device = normalizeXMinCell(cells[deviceIndex >= 0 ? deviceIndex : 0]) || "Unknown";
-    const date = normalizeXMinCell(cells[dateIndex >= 0 ? dateIndex : 1]).replace("T", " ");
-    devicesSet.add(device);
-
-    const ms = parseXMinDateMs(date);
-    if (Number.isFinite(ms)) {
-      if (ms < minMs) { minMs = ms; firstDate = date; }
-      if (ms > maxMs) { maxMs = ms; lastDate = date; }
-    }
-
-    if (!deviceMap.has(device)) {
-      deviceMap.set(device, { device, rowsCount: 0, firstDate: "", lastDate: "", firstMs: Infinity, lastMs: -Infinity, exceedanceCount: 0 });
-    }
-    const devRec = deviceMap.get(device);
-    devRec.rowsCount += 1;
-    if (Number.isFinite(ms)) {
-      if (ms < devRec.firstMs) { devRec.firstMs = ms; devRec.firstDate = date; }
-      if (ms > devRec.lastMs) { devRec.lastMs = ms; devRec.lastDate = date; }
-    }
-
-    if (preview.length < MAX_PREVIEW_ROWS) {
-      const obj = {};
-      for (let j = 0; j < headers.length; j += 1) obj[headers[j]] = normalizeXMinCell(cells[j]);
-      preview.push(obj);
-    }
-
-    for (const colIndex of variableIndexes) {
-      const variable = headers[colIndex];
-      const n = parseXMinNumber(cells[colIndex]);
-      if (!Number.isFinite(n)) continue;
-      const rec = variableMap.get(variable);
-      if (!rec) continue;
-      rec.numericCount += 1;
-      rec.sum += n;
-      if (n < rec.min) rec.min = n;
-      if (n > rec.max) {
-        rec.max = n;
-        rec.maxDevice = device;
-        rec.maxDate = date;
-      }
-      const rule = limitRules.get(variable);
-      if (rule && n > rule.limit) {
-        exceedanceCount += 1;
-        affectedDevices.add(device);
-        affectedVariables.add(variable);
-        rec.exceedanceCount += 1;
-        devRec.exceedanceCount += 1;
-        if (exceedanceRows.length < 300) {
-          exceedanceRows.push({
-            device,
-            variable,
-            date,
-            value: roundXMin(n, 3),
-            limit: rule.limit,
-            exceedBy: roundXMin(n - rule.limit, 3)
-          });
-        }
-      }
-    }
-  }
-
-  const devices = Array.from(devicesSet).sort((a, b) => a.localeCompare(b));
-  const variableStats = Array.from(variableMap.values()).map((rec) => ({
-    variable: rec.variable,
-    category: rec.category,
-    numericCount: rec.numericCount,
-    min: rec.numericCount ? roundXMin(rec.min, 3) : null,
-    max: rec.numericCount ? roundXMin(rec.max, 3) : null,
-    avg: rec.numericCount ? roundXMin(rec.sum / rec.numericCount, 3) : null,
-    maxDevice: rec.maxDevice,
-    maxDate: rec.maxDate,
-    exceedanceLimit: rec.exceedanceLimit,
-    exceedanceCount: rec.exceedanceCount
-  }));
-  const deviceStats = Array.from(deviceMap.values()).map((rec) => ({
-    device: rec.device,
-    rowsCount: rec.rowsCount,
-    firstDate: rec.firstDate,
-    lastDate: rec.lastDate,
-    exceedanceCount: rec.exceedanceCount
-  })).sort((a, b) => b.rowsCount - a.rowsCount || a.device.localeCompare(b.device));
-  const temperatureHotspots = variableStats
-    .filter((rec) => /temp|temperature/i.test(rec.variable) && Number.isFinite(rec.max))
-    .sort((a, b) => (b.max ?? -Infinity) - (a.max ?? -Infinity))
-    .slice(0, 50);
-  const topExceedanceVariables = variableStats
-    .filter((rec) => rec.exceedanceCount > 0)
-    .sort((a, b) => b.exceedanceCount - a.exceedanceCount || String(a.variable).localeCompare(String(b.variable)))
-    .slice(0, 50);
-  exceedanceRows.sort((a, b) => (b.exceedBy || 0) - (a.exceedBy || 0));
-
-  return {
-    parsed: {
-      label: fileInfo.label || "xmin",
-      fileName: fileInfo.fileName || "x-minute-file",
-      fileType: fileInfo.fileType || "text/csv",
-      fileSizeBytes: fileInfo.fileSizeBytes || 0,
-      rowsCount,
-      delimiter,
-      columns: headers,
-      variables,
-      devices,
-      preview
-    },
-    analysis: {
-      phase: "backend-analysis-lite",
-      calculatedAt: new Date().toISOString(),
-      totalRows: rowsCount,
-      devicesCount: devices.length,
-      variablesCount: variables.length,
-      dateRange: { first: firstDate, last: lastDate },
-      categories,
-      deviceStats,
-      variableStats,
-      temperatureHotspots,
-      exceedances: {
-        total: exceedanceCount,
-        returnedRows: exceedanceRows.length,
-        affectedDevices: affectedDevices.size,
-        affectedVariables: affectedVariables.size,
-        topVariables: topExceedanceVariables,
-        rows: exceedanceRows
-      }
-    }
-  };
-}
-
-
-const XMIN_SAMPLE_MAX_BYTES = 220000;
-const XMIN_SAMPLE_MAX_LINES = 650;
-
-async function readXMinBackendSampleText(file, maxBytes = XMIN_SAMPLE_MAX_BYTES, maxLines = XMIN_SAMPLE_MAX_LINES) {
-  // Keep X-Minute backend verification safely below Cloudflare Worker CPU limits.
-  // The browser still loads the full CSV locally for tables/filters; the Worker only
-  // validates and analyses a small bounded sample to avoid runtime aborts that appear
-  // as CORS errors in Chrome.
-  let text = "";
-  try {
-    if (file && typeof file.slice === "function") {
-      text = await file.slice(0, maxBytes).text();
-    } else if (file && typeof file.text === "function") {
-      text = (await file.text()).slice(0, maxBytes);
-    }
-  } catch (error) {
-    // Fallback for runtimes where File.slice().text() is unavailable.
-    if (file && typeof file.text === "function") text = (await file.text()).slice(0, maxBytes);
-    else throw error;
-  }
-  text = String(text || "").replace(/^\uFEFF/, "");
-  const lastNewline = Math.max(text.lastIndexOf("\n"), text.lastIndexOf("\r"));
-  if (lastNewline > 0 && text.length >= maxBytes - 1024) text = text.slice(0, lastNewline);
-  const lines = text.split(/\r?\n/);
-  if (lines.length > maxLines + 1) text = lines.slice(0, maxLines + 1).join("\n");
-  return text;
-}
-
 async function handleXMinUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
@@ -1108,53 +844,43 @@ async function handleXMinUpload(request, env) {
 
   const form = await request.formData();
   const file = form.get("file") || form.get("xmin") || form.get("csv");
-  if (!file || typeof file.text !== "function") {
+  if (!file || typeof file.arrayBuffer !== "function") {
     return jsonResponse(request, env, {
       success: false,
       message: "No valid X-Minute file was uploaded. Send a file field named file, xmin, or csv."
     }, 400);
   }
 
-  const sampleText = await readXMinBackendSampleText(file);
-  const result = computeXMinAnalysisLiteFromText(sampleText, {
-    label: "xmin",
-    fileName: file.name || "x-minute-file",
-    fileType: file.type || "text/csv",
-    fileSizeBytes: file.size || sampleText.length
-  });
-  const parsed = result.parsed;
-  const analysis = result.analysis;
-
+  const parsed = await parseXMinTextFile(file, "xmin");
+  const analysis = computeXMinAnalysis(parsed);
   return jsonResponse(request, env, {
     success: true,
     module: "X-Minute",
     phase: "backend-upload-parse-and-analysis",
     storageMode: "temporary-request-memory",
     persistentStorage: false,
-    responseMode: "analysis-only",
-    backendMode: "safe-sample-single-pass",
-    sampled: true,
-    sampleLimits: {
-      maxBytes: XMIN_SAMPLE_MAX_BYTES,
-      maxLines: XMIN_SAMPLE_MAX_LINES
-    },
-    note: "X-Minute backend verification uses a bounded CSV sample to stay within Cloudflare Worker CPU limits. Full rows are processed locally in the browser for tables, filters, and charts.",
+    note: "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
     receivedAt: new Date().toISOString(),
     file: {
       fileName: parsed.fileName,
       fileType: parsed.fileType,
       fileSizeBytes: parsed.fileSizeBytes,
       rowsCount: parsed.rowsCount,
-      sampleRowsCount: parsed.rowsCount,
       delimiter: parsed.delimiter,
       columns: parsed.columns,
       variables: parsed.variables,
       devices: parsed.devices,
       preview: parsed.preview
     },
+    parsed: {
+      header: parsed.columns,
+      variables: parsed.variables,
+      devices: parsed.devices,
+      data: parsed.rows
+    },
     analysis,
     summary: {
-      sampleRows: parsed.rowsCount,
+      totalRows: parsed.rowsCount,
       devicesCount: parsed.devices.length,
       variablesCount: parsed.variables.length
     }
