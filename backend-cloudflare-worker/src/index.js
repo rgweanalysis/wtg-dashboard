@@ -830,6 +830,9 @@ function computeXMinAnalysis(parsed) {
 }
 
 async function handleXMinUpload(request, env) {
+  const url = new URL(request.url);
+  const responseMode = String(url.searchParams.get("mode") || url.searchParams.get("responseMode") || "full").toLowerCase();
+  const analysisOnly = responseMode === "analysis" || responseMode === "analysis-only" || responseMode === "light" || responseMode === "summary";
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
     return jsonResponse(request, env, {
@@ -849,13 +852,17 @@ async function handleXMinUpload(request, env) {
 
   const parsed = await parseXMinTextFile(file, "xmin");
   const analysis = computeXMinAnalysis(parsed);
-  return jsonResponse(request, env, {
+
+  const commonPayload = {
     success: true,
     module: "X-Minute",
     phase: "backend-upload-parse-and-analysis",
     storageMode: "temporary-request-memory",
     persistentStorage: false,
-    note: "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
+    responseMode: analysisOnly ? "analysis-only" : "full",
+    note: analysisOnly
+      ? "X-Minute was parsed and analysed inside Cloudflare Worker memory. Full row data is intentionally not returned to avoid large-response/CORS failures. Rows are still loaded locally in the browser for the UI."
+      : "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
     receivedAt: new Date().toISOString(),
     file: {
       fileName: parsed.fileName,
@@ -868,17 +875,25 @@ async function handleXMinUpload(request, env) {
       devices: parsed.devices,
       preview: parsed.preview
     },
-    parsed: {
-      header: parsed.columns,
-      variables: parsed.variables,
-      devices: parsed.devices,
-      data: parsed.rows
-    },
     analysis,
     summary: {
       totalRows: parsed.rowsCount,
       devicesCount: parsed.devices.length,
       variablesCount: parsed.variables.length
+    }
+  };
+
+  if (analysisOnly) {
+    return jsonResponse(request, env, commonPayload);
+  }
+
+  return jsonResponse(request, env, {
+    ...commonPayload,
+    parsed: {
+      header: parsed.columns,
+      variables: parsed.variables,
+      devices: parsed.devices,
+      data: parsed.rows
     }
   });
 }

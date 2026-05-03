@@ -3132,7 +3132,7 @@ function updateAawIgnoreHint() {
       const formData = new FormData();
       formData.append('file', file, file.name || 'x-minute-file');
 
-      const response = await fetch(baseUrl + '/api/xmin/upload', {
+      const response = await fetch(baseUrl + '/api/xmin/upload?mode=analysis', {
         method: 'POST',
         body: formData
       });
@@ -3269,18 +3269,41 @@ function updateAawIgnoreHint() {
         try {
           setUnifiedStatus('xmin', 'processing', 'Processing', hasSharedAWS ? 'Sending X‑Minutal file to the backend and automatically linking the shared AWS file.' : 'Sending X‑Minutal file to the backend for parsing.');
           const backendResult = await uploadXMinFileToBackend(file);
-          if (backendResult && typeof frames.xmin?.contentWindow?.__applyXMinBackendParsedResult === 'function') {
-            frames.xmin.contentWindow.__applyXMinBackendParsedResult(backendResult);
+          if (backendResult) {
             console.info('X-Minute backend parse result:', backendResult);
+            const parsedForRows = backendResult.parsed || backendResult.file || null;
+            const backendRows = (parsedForRows && (parsedForRows.data || parsedForRows.rows)) || [];
+
+            // Full-row backend payloads can still be rendered directly, but the preferred
+            // Cloudflare-safe mode returns analysis only and lets the iframe load rows locally.
+            if (backendRows.length && typeof frames.xmin?.contentWindow?.__applyXMinBackendParsedResult === 'function') {
+              frames.xmin.contentWindow.__applyXMinBackendParsedResult(backendResult);
+              await sleep(240);
+              await setXMinCurveDrawState(false, { render:false });
+              const totalRows = backendResult && backendResult.summary ? backendResult.summary.totalRows : backendRows.length;
+              setUnifiedStatus('xmin', totalRows ? 'ready' : 'waiting', totalRows ? 'Backend parsed' : 'No rows', totalRows ? `X‑Minutal parsed in backend and loaded ${totalRows} row(s).` : 'X‑Minutal backend parsed the file, but no rows were returned.');
+              if (!window.__unifiedApplyBusy) refreshStatusesFromFrames();
+              scheduleUnifiedSidebarSync(120);
+              return;
+            }
+
+            // Analysis-only backend mode: backend performs the heavy analysis, while the
+            // browser loads the raw rows for table/filter rendering without a huge JSON response.
+            if (frames.xmin?.contentWindow) {
+              frames.xmin.contentWindow.__lastXMinBackendResult = backendResult;
+              frames.xmin.contentWindow.__lastRenderedXMinBackendAnalysis = backendResult.analysis || null;
+            }
+            assignFilesToChildInput(doc.getElementById('csvInput'), [file]);
+            const ready = await waitForXMinReady();
             await sleep(240);
             await setXMinCurveDrawState(false, { render:false });
-            const totalRows = backendResult && backendResult.summary ? backendResult.summary.totalRows : 0;
-            setUnifiedStatus('xmin', totalRows ? 'ready' : 'waiting', totalRows ? 'Backend parsed' : 'No rows', totalRows ? `X‑Minutal parsed in backend and loaded ${totalRows} row(s).` : 'X‑Minutal backend parsed the file, but no rows were returned.');
+            const totalRows = backendResult && backendResult.summary ? backendResult.summary.totalRows : (backendResult.analysis && backendResult.analysis.totalRows ? backendResult.analysis.totalRows : 0);
+            setUnifiedStatus('xmin', ready ? 'ready' : 'processing', ready ? 'Backend analysed' : 'Processing', ready ? `X‑Minutal analysis ran in backend; ${totalRows || 'the'} row(s) are loaded locally for the UI.` : 'X‑Minutal backend analysis finished; the table is still loading locally.');
             if (!window.__unifiedApplyBusy) refreshStatusesFromFrames();
             scheduleUnifiedSidebarSync(120);
             return;
           }
-          throw new Error('X-Minute frame does not expose __applyXMinBackendParsedResult.');
+          throw new Error('X-Minute backend did not return a result.');
         } catch (backendError) {
           console.warn('X-Minute backend parse failed; continuing with browser parser.', backendError);
           setUnifiedStatus('xmin', 'processing', 'Backend fallback', 'X‑Minutal backend parse failed. Continuing with the browser parser.');
