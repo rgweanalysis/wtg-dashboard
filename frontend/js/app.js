@@ -10428,3 +10428,206 @@ function bindUnifiedInputs() {
 
   window.__installXMinSpeedPatch = injectXminSpeedPatch;
 })();
+
+
+/* ===== AWS backend column/date fix + X-Minute large-file safe verification ===== */
+(function(){
+  if (window.__wtgAwsDateColumnFixOuterInstalled) return;
+  window.__wtgAwsDateColumnFixOuterInstalled = true;
+
+  const AWS_FIX_SCRIPT_ID = 'bridge-aws-backend-column-date-fix-v2';
+  const AWS_FIX_SCRIPT = `
+(function(){
+  if (window.__awsBackendColumnDateFixV2Installed) return;
+  window.__awsBackendColumnDateFixV2Installed = true;
+
+  function normHeader(value){
+    return String(value || '')
+      .toLowerCase()
+      .replace(/[\u200f\u200e]/g, '')
+      .replace(/[_\-\/\\]+/g, ' ')
+      .replace(/[^a-z0-9\u0600-\u06ff]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  function findHeaderByTerms(terms, excludes){
+    if (!Array.isArray(header)) return '';
+    terms = terms || [];
+    excludes = excludes || [];
+    var best = '';
+    var bestScore = -1;
+    header.forEach(function(h){
+      var n = normHeader(h);
+      if (!n) return;
+      if (excludes.some(function(ex){ return n.indexOf(ex) !== -1; })) return;
+      terms.forEach(function(term, idx){
+        term = normHeader(term);
+        if (!term) return;
+        var score = -1;
+        if (n === term) score = 100 - idx;
+        else if (n.indexOf(term) !== -1) score = 60 - idx;
+        else {
+          var parts = term.split(' ').filter(Boolean);
+          if (parts.length && parts.every(function(p){ return n.indexOf(p) !== -1; })) score = 40 - idx;
+        }
+        if (score > bestScore) { bestScore = score; best = h; }
+      });
+    });
+    return best;
+  }
+  function applyBackendSelectedColumns(payload){
+    try {
+      var selected = payload && payload.selectedColumns ? payload.selectedColumns : {};
+      if (selected && typeof selected === 'object') {
+        Object.keys(selected).forEach(function(key){
+          if (selected[key]) colMap[key] = selected[key];
+        });
+      }
+      if (!colMap.device) colMap.device = findHeaderByTerms(['device','wtg','turbine','device wtg','asset','unit','tag','object','equipment','اسم التوربينة','التربينة']);
+      if (!colMap.event) colMap.event = findHeaderByTerms(['event name','alarm name','event','alarm','fault','warning','subevent','categorization','categorisation','اسم الإنذار'], ['date','time','duration']);
+      if (!colMap.category) colMap.category = findHeaderByTerms(['category','categorization','categorisation','event category','category event','type','الفئة','توصيف']);
+      if (!colMap.duration) colMap.duration = findHeaderByTerms(['total duration','duration','duration hh mm ss','مدة'], ['start','end','date']);
+      if (!colMap.start) colMap.start = findHeaderByTerms(['start date','start time','event start','alarm start','start','from date','from time','timestamp','date time','datetime','date','بداية الحدث','تاريخ البداية'], ['end','duration','total']);
+      if (!colMap.end) colMap.end = findHeaderByTerms(['end date','end time','event end','alarm end','end','to date','to time','stop','finish','نهاية الحدث','تاريخ النهاية'], ['start','duration','total']);
+      if (!colMap.subevent) colMap.subevent = findHeaderByTerms(['subevent','subevent categorization','subevent / categorization','categorization description','categorisation description']);
+    } catch (e) {
+      console.warn('AWS backend selected column mapping failed:', e);
+    }
+  }
+  function parseFlexibleDate(value){
+    var text = String(value == null ? '' : value).trim().replace(/[\u200f\u200e]/g, '');
+    if (!text) return null;
+    if (/^-?\d+(?:\.\d+)?$/.test(text.replace(/,/g,''))) {
+      var serial = Number(text.replace(/,/g,''));
+      if (serial > 20000 && serial < 100000) {
+        var d0 = new Date((serial - 25569) * 86400 * 1000);
+        if (!isNaN(d0.getTime())) return d0;
+      }
+    }
+    var direct = new Date(text.replace(' ', 'T'));
+    if (!isNaN(direct.getTime())) return direct;
+    var m = text.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2,4})(?:[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+    if (m) {
+      var a = parseInt(m[1],10), b = parseInt(m[2],10), y = parseInt(m[3],10);
+      if (y < 100) y += 2000;
+      // Prefer day/month/year when the first part is > 12; otherwise keep month/day for US-like strings.
+      var day, month;
+      if (a > 12) { day = a; month = b - 1; }
+      else if (b > 12) { day = b; month = a - 1; }
+      else { day = a; month = b - 1; }
+      var h = parseInt(m[4] || '0',10), mi = parseInt(m[5] || '0',10), s = parseInt(m[6] || '0',10);
+      var d = new Date(y, month, day, h, mi, s);
+      if (!isNaN(d.getTime())) return d;
+    }
+    return null;
+  }
+
+  try {
+    parseRowDate = function(row) {
+      var s = colMap.start ? (row[colMap.start] || '') : '';
+      var e = colMap.end ? (row[colMap.end] || '') : '';
+      var startDate = parseFlexibleDate(s);
+      var endDate = parseFlexibleDate(e);
+      if (startDate && !endDate) endDate = startDate;
+      if (!startDate && endDate) startDate = endDate;
+      return { startDate: startDate, endDate: endDate };
+    };
+    window.parseRowDate = parseRowDate;
+  } catch (e) {}
+
+  window.__applyAWSBackendParsedResult = function(payload) {
+    var parsed = payload && (payload.parsed || payload.file || payload);
+    var incomingHeader = (parsed && (parsed.header || parsed.columns)) || [];
+    var incomingData = (parsed && (parsed.data || parsed.rows)) || [];
+
+    try { hideMessage(); } catch (_) {}
+    try { if (typeof renderAWSBackendAnalysis === 'function') renderAWSBackendAnalysis(payload && payload.analysis); } catch (_) {}
+    dataset = [];
+    header = [];
+    colMap = {};
+    filteredData = [];
+    events = [];
+    selectedEvents = new Set(['__ALL__']);
+    searchTerm = '';
+    searchedEvents = [];
+    try { tableContainer.innerHTML = ''; } catch (_) {}
+    try { analysisTableContainer.innerHTML = ''; } catch (_) {}
+    try { exportBtn.style.display = 'none'; exportExcelBtn.style.display = 'none'; exportPdfBtn.style.display = 'none'; } catch (_) {}
+
+    header = incomingHeader.map(function(h){ return String(h || '').trim(); }).filter(Boolean);
+    dataset = incomingData.map(function(row){
+      var obj = {};
+      header.forEach(function(h){ obj[h] = row && row[h] != null ? String(row[h]).trim() : ''; });
+      if (row && typeof row === 'object') {
+        Object.keys(row).forEach(function(k){
+          var cleanKey = String(k || '').trim();
+          if (cleanKey && !(cleanKey in obj)) obj[cleanKey] = row[k] != null ? String(row[k]).trim() : '';
+        });
+      }
+      return obj;
+    }).filter(function(row){
+      return Object.values(row).some(function(v){ return String(v || '').trim() !== ''; });
+    });
+
+    if (!header.length && dataset.length) header = Object.keys(dataset[0]);
+    if (!dataset.length) {
+      try { showMessage('No rows were returned from the AWS backend parser.'); } catch (_) {}
+      return false;
+    }
+
+    try { detectColumns(); } catch (_) {}
+    applyBackendSelectedColumns(payload);
+
+    if (!colMap.device || !colMap.event || !colMap.category) {
+      try { showMessage('The AWS backend parsed the file, but the required columns were not found (Device, Event, Category).'); } catch (_) {}
+      return false;
+    }
+
+    try { filtersDiv.style.display = 'block'; } catch (_) {}
+    filteredData = dataset.slice();
+    try { buildCategoryFilters(); } catch (_) {}
+    try { updateFilteredData(); } catch (e) { console.warn('AWS backend table render failed:', e); }
+    try { window.__lastAWSAppliedColumnMap = Object.assign({}, colMap); } catch (_) {}
+    return true;
+  };
+})();`;
+
+  function injectAwsFix(){
+    try {
+      const frame = document.getElementById('frame-aws');
+      const doc = frame && (frame.contentDocument || (frame.contentWindow && frame.contentWindow.document));
+      if (!doc || !doc.body) return false;
+      if (doc.getElementById(AWS_FIX_SCRIPT_ID)) return true;
+      const script = doc.createElement('script');
+      script.id = AWS_FIX_SCRIPT_ID;
+      script.textContent = AWS_FIX_SCRIPT;
+      doc.body.appendChild(script);
+      return true;
+    } catch (err) {
+      console.warn('AWS date/column fix injection skipped:', err);
+      return false;
+    }
+  }
+  function scheduleAwsFix(){ [0, 120, 500, 1200].forEach(delay => setTimeout(injectAwsFix, delay)); }
+  try {
+    if (frames && frames.aws && !frames.aws.__awsDateColumnFixLoadHooked) {
+      frames.aws.__awsDateColumnFixLoadHooked = true;
+      frames.aws.addEventListener('load', scheduleAwsFix);
+    }
+  } catch (_) {}
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', scheduleAwsFix);
+  else scheduleAwsFix();
+
+  // Keep a top-window copy of the X-Minute backend result for easier verification.
+  const originalUploadXMin = (typeof uploadXMinFileToBackend === 'function') ? uploadXMinFileToBackend : null;
+  if (originalUploadXMin && !originalUploadXMin.__wtgTopVerificationWrapped) {
+    const wrapped = async function(file){
+      const result = await originalUploadXMin.apply(this, arguments);
+      try { window.__lastXMinBackendResult = result; } catch (_) {}
+      return result;
+    };
+    wrapped.__wtgTopVerificationWrapped = true;
+    try { uploadXMinFileToBackend = wrapped; } catch (_) {}
+    window.uploadXMinFileToBackend = wrapped;
+  }
+})();
