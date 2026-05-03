@@ -120,9 +120,33 @@ async function parseGenericTableFile(file, label) {
 
   if (lowerName.endsWith(".csv") || lowerName.endsWith(".txt")) {
     const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
-    workbook = XLSX.read(text, { type: "string", cellDates: false, raw: false });
+    const lines = text.split(/\r?\n/).filter((line) => String(line || "").trim() !== "");
+    if (!lines.length) throw new Error(`${label} file is empty.`);
+    const delimiter = detectXMinDelimiter(lines[0]);
+    const columns = splitXMinCsvLine(lines[0], delimiter).map((h, idx) => String(h || `Column ${idx + 1}`).trim()).filter(Boolean);
+    const rows = [];
+    for (const line of lines.slice(1)) {
+      const cells = splitXMinCsvLine(line, delimiter);
+      const row = {};
+      columns.forEach((col, idx) => {
+        row[col] = normalizeXMinCell(cells[idx]);
+      });
+      if (Object.values(row).some((value) => String(value || "").trim() !== "")) rows.push(row);
+    }
+    return {
+      label,
+      fileName,
+      fileType: file.type || "text/csv",
+      fileSizeBytes: file.size || bytes.byteLength,
+      sheetName: "CSV",
+      rowsCount: rows.length,
+      columns,
+      header: columns,
+      data: rows,
+      preview: rows.slice(0, MAX_PREVIEW_ROWS)
+    };
   } else {
-    workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
+    workbook = XLSX.read(bytes, { type: "array", cellDates: true, raw: false });
   }
 
   if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
@@ -1044,8 +1068,36 @@ function computeXMinAnalysisLiteFromText(text, fileInfo = {}) {
   };
 }
 
+
+const XMIN_SAMPLE_MAX_BYTES = 220000;
+const XMIN_SAMPLE_MAX_LINES = 650;
+
+async function readXMinBackendSampleText(file, maxBytes = XMIN_SAMPLE_MAX_BYTES, maxLines = XMIN_SAMPLE_MAX_LINES) {
+  // Keep X-Minute backend verification safely below Cloudflare Worker CPU limits.
+  // The browser still loads the full CSV locally for tables/filters; the Worker only
+  // validates and analyses a small bounded sample to avoid runtime aborts that appear
+  // as CORS errors in Chrome.
+  let text = "";
+  try {
+    if (file && typeof file.slice === "function") {
+      text = await file.slice(0, maxBytes).text();
+    } else if (file && typeof file.text === "function") {
+      text = (await file.text()).slice(0, maxBytes);
+    }
+  } catch (error) {
+    // Fallback for runtimes where File.slice().text() is unavailable.
+    if (file && typeof file.text === "function") text = (await file.text()).slice(0, maxBytes);
+    else throw error;
+  }
+  text = String(text || "").replace(/^\uFEFF/, "");
+  const lastNewline = Math.max(text.lastIndexOf("\n"), text.lastIndexOf("\r"));
+  if (lastNewline > 0 && text.length >= maxBytes - 1024) text = text.slice(0, lastNewline);
+  const lines = text.split(/\r?\n/);
+  if (lines.length > maxLines + 1) text = lines.slice(0, maxLines + 1).join("\n");
+  return text;
+}
+
 async function handleXMinUpload(request, env) {
-  const url = new URL(request.url);
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
     return jsonResponse(request, env, {
@@ -1063,15 +1115,12 @@ async function handleXMinUpload(request, env) {
     }, 400);
   }
 
-  // X-Minute files can be large. This endpoint intentionally uses a lightweight
-  // single-pass analyzer and does not return raw rows, preventing Cloudflare CPU/
-  // response-size failures that appear in browsers as CORS errors.
-  const text = await file.text();
-  const result = computeXMinAnalysisLiteFromText(text, {
+  const sampleText = await readXMinBackendSampleText(file);
+  const result = computeXMinAnalysisLiteFromText(sampleText, {
     label: "xmin",
     fileName: file.name || "x-minute-file",
     fileType: file.type || "text/csv",
-    fileSizeBytes: file.size || text.length
+    fileSizeBytes: file.size || sampleText.length
   });
   const parsed = result.parsed;
   const analysis = result.analysis;
@@ -1083,14 +1132,20 @@ async function handleXMinUpload(request, env) {
     storageMode: "temporary-request-memory",
     persistentStorage: false,
     responseMode: "analysis-only",
-    backendMode: "lite-single-pass",
-    note: "X-Minute was parsed and analysed in Cloudflare Worker memory using a lightweight single-pass analyzer. Raw rows are not returned; the browser loads them locally for tables and filters.",
+    backendMode: "safe-sample-single-pass",
+    sampled: true,
+    sampleLimits: {
+      maxBytes: XMIN_SAMPLE_MAX_BYTES,
+      maxLines: XMIN_SAMPLE_MAX_LINES
+    },
+    note: "X-Minute backend verification uses a bounded CSV sample to stay within Cloudflare Worker CPU limits. Full rows are processed locally in the browser for tables, filters, and charts.",
     receivedAt: new Date().toISOString(),
     file: {
       fileName: parsed.fileName,
       fileType: parsed.fileType,
       fileSizeBytes: parsed.fileSizeBytes,
       rowsCount: parsed.rowsCount,
+      sampleRowsCount: parsed.rowsCount,
       delimiter: parsed.delimiter,
       columns: parsed.columns,
       variables: parsed.variables,
@@ -1099,7 +1154,7 @@ async function handleXMinUpload(request, env) {
     },
     analysis,
     summary: {
-      totalRows: parsed.rowsCount,
+      sampleRows: parsed.rowsCount,
       devicesCount: parsed.devices.length,
       variablesCount: parsed.variables.length
     }
