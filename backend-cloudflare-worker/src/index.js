@@ -331,12 +331,13 @@ function isAWSWarning903(row, colMap) {
 }
 
 function buildAWSEmergencyIncidents(rows, colMap) {
-  // Count every distinct WindTurbine Emergency occurrence from the AWS event log.
-  // Older versions merged overlapping/continuous state intervals, which made turbines
-  // with several emergency entries appear as a single incident. For recurrence analysis
-  // the start timestamp is the occurrence key; exact duplicate starts are ignored.
+  // Count every AWS row where the turbine entered WindTurbine Emergency.
+  // Do NOT de-duplicate by start timestamp: many exported AWS files store dates
+  // at day precision (00:00), so several emergency occurrences on the same day
+  // can share the same parsed start time. De-duplicating by timestamp collapses
+  // them incorrectly into one incident.
   const incidents = [];
-  const seenStarts = new Set();
+  let order = 0;
   for (const row of rows || []) {
     const category = classifyAWSCategory(row, colMap);
     const eventName = getAWSEventName(row, colMap);
@@ -346,12 +347,9 @@ function buildAWSEmergencyIncidents(rows, colMap) {
     if (!bounds.start) continue;
     const startMs = bounds.start.getTime();
     if (!Number.isFinite(startMs)) continue;
-    const key = String(startMs);
-    if (seenStarts.has(key)) continue;
-    seenStarts.add(key);
-    incidents.push({ start: bounds.start, end: bounds.end || bounds.start });
+    incidents.push({ start: bounds.start, end: bounds.end || bounds.start, eventName, order: order++ });
   }
-  incidents.sort((a, b) => a.start - b.start);
+  incidents.sort((a, b) => (a.start - b.start) || (a.order - b.order));
   return incidents;
 }
 
@@ -489,7 +487,7 @@ function buildAWSBackendAnalysis(rows, colMap) {
   emergencyRows.sort((a, b) => (b.incidentCount - a.incidentCount) || ((a.avgGapMinutes ?? Number.POSITIVE_INFINITY) - (b.avgGapMinutes ?? Number.POSITIVE_INFINITY)) || a.device.localeCompare(b.device));
 
   return {
-    version: "aws-backend-analysis-v2",
+    version: "aws-backend-analysis-v3",
     rowsAnalyzed: Array.isArray(rows) ? rows.length : 0,
     categories: Object.fromEntries(Object.entries(categories).map(([key, value]) => [key, { ...value, durationFormatted: formatAWSDuration(value.durationSeconds) }])),
     datesCount: Array.from(dateKeys).filter(Boolean).length,
