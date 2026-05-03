@@ -331,8 +331,12 @@ function isAWSWarning903(row, colMap) {
 }
 
 function buildAWSEmergencyIncidents(rows, colMap) {
-  const MERGE_GAP_MS = 5 * 60 * 1000;
-  const intervals = [];
+  // Count every distinct WindTurbine Emergency occurrence from the AWS event log.
+  // Older versions merged overlapping/continuous state intervals, which made turbines
+  // with several emergency entries appear as a single incident. For recurrence analysis
+  // the start timestamp is the occurrence key; exact duplicate starts are ignored.
+  const incidents = [];
+  const seenStarts = new Set();
   for (const row of rows || []) {
     const category = classifyAWSCategory(row, colMap);
     const eventName = getAWSEventName(row, colMap);
@@ -340,20 +344,15 @@ function buildAWSEmergencyIncidents(rows, colMap) {
     if (!/windturbine/i.test(eventName) || !/(^|\b)emergency(\b|$)/i.test(eventName)) continue;
     const bounds = getAWSRowBounds(row, colMap);
     if (!bounds.start) continue;
-    intervals.push({ start: bounds.start, end: bounds.end || bounds.start });
+    const startMs = bounds.start.getTime();
+    if (!Number.isFinite(startMs)) continue;
+    const key = String(startMs);
+    if (seenStarts.has(key)) continue;
+    seenStarts.add(key);
+    incidents.push({ start: bounds.start, end: bounds.end || bounds.start });
   }
-  intervals.sort((a, b) => a.start - b.start);
-  const merged = [];
-  for (const item of intervals) {
-    if (!merged.length) { merged.push({ ...item }); continue; }
-    const last = merged[merged.length - 1];
-    if (item.start.getTime() <= last.end.getTime() + MERGE_GAP_MS) {
-      if (item.end.getTime() > last.end.getTime()) last.end = item.end;
-    } else {
-      merged.push({ ...item });
-    }
-  }
-  return merged;
+  incidents.sort((a, b) => a.start - b.start);
+  return incidents;
 }
 
 function medianNumber(values) {
@@ -467,7 +466,9 @@ function buildAWSBackendAnalysis(rows, colMap) {
     }
     const gaps = [];
     for (let i = 1; i < incidents.length; i += 1) {
-      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].end.getTime()) / 60000);
+      // Recurrence gap is measured between emergency start times, not previous end time.
+      // This avoids zero gaps when an AWS state interval spans until the next state change.
+      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].start.getTime()) / 60000);
       gaps.push(minutes);
       allEmergencyIntervals.push(minutes);
     }

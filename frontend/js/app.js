@@ -9004,10 +9004,16 @@ function bindUnifiedInputs() {
   }
 
   function buildEmergencyIncidents(rows) {
-    const emergencyIntervals = rows
+    const seenStarts = new Set();
+    return rows
       .map(row => {
         const bounds = parseRowBounds(row);
         if (!bounds.start || !isEmergencyStateRow(row)) return null;
+        const startMs = bounds.start.getTime();
+        if (!Number.isFinite(startMs)) return null;
+        const key = String(startMs);
+        if (seenStarts.has(key)) return null;
+        seenStarts.add(key);
         return {
           start: bounds.start,
           end: bounds.end || bounds.start
@@ -9015,24 +9021,6 @@ function bindUnifiedInputs() {
       })
       .filter(Boolean)
       .sort((a, b) => a.start - b.start);
-
-    if (!emergencyIntervals.length) return [];
-
-    const merged = [];
-    emergencyIntervals.forEach(item => {
-      if (!merged.length) {
-        merged.push({ start: item.start, end: item.end });
-        return;
-      }
-      const last = merged[merged.length - 1];
-      if (item.start.getTime() <= last.end.getTime() + MERGE_GAP_MS) {
-        if (item.end.getTime() > last.end.getTime()) last.end = item.end;
-      } else {
-        merged.push({ start: item.start, end: item.end });
-      }
-    });
-
-    return merged;
   }
 
   function describeTopPriorAlarms(alarmsByName) {
@@ -9174,7 +9162,7 @@ function bindUnifiedInputs() {
       for (let index = 1; index < incidents.length; index += 1) {
         const previous = incidents[index - 1];
         const current = incidents[index];
-        const minutes = Math.max(0, (current.start.getTime() - previous.end.getTime()) / 60000);
+        const minutes = Math.max(0, (current.start.getTime() - previous.start.getTime()) / 60000);
         gapsMinutes.push(minutes);
         allIntervals.push(minutes);
       }
