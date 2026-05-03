@@ -216,6 +216,298 @@ function summarizeAWSRows(rows, colMap) {
   };
 }
 
+
+function parseAWSDurationSeconds(value) {
+  if (value == null) return 0;
+  const raw = String(value).trim();
+  if (!raw) return 0;
+  const cleaned = raw.replace(/;+$/g, "").replace(/,/g, ".");
+  const dayMatch = cleaned.match(/(?:(\d+(?:\.\d+)?)\s*d(?:ay)?s?)?\s*(\d{1,3}):(\d{1,2})(?::(\d{1,2}(?:\.\d+)?))?/i);
+  if (dayMatch) {
+    const days = parseFloat(dayMatch[1] || "0") || 0;
+    const a = parseFloat(dayMatch[2] || "0") || 0;
+    const b = parseFloat(dayMatch[3] || "0") || 0;
+    const c = parseFloat(dayMatch[4] || "0") || 0;
+    // If there are three clock parts: HH:MM:SS. If only two: MM:SS.
+    if (dayMatch[4] != null) return (days * 86400) + (a * 3600) + (b * 60) + c;
+    return (days * 86400) + (a * 60) + b;
+  }
+  const parts = cleaned.split(":").map((part) => parseFloat(part));
+  if (parts.length === 3 && parts.every(Number.isFinite)) return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+  if (parts.length === 2 && parts.every(Number.isFinite)) return (parts[0] * 60) + parts[1];
+  const num = parseFloat(cleaned.replace(/[^0-9.\-]/g, ""));
+  return Number.isFinite(num) ? Math.max(0, num) : 0;
+}
+
+function formatAWSDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function parseAWSDateValue(value) {
+  if (value == null || value === "") return null;
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    // Excel serial date fallback.
+    const epoch = new Date(Date.UTC(1899, 11, 30));
+    const millis = epoch.getTime() + value * 86400000;
+    const d = new Date(millis);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  let raw = String(value).trim();
+  if (!raw) return null;
+  raw = raw.replace(/[\u200e\u200f]/g, "").replace(/\s+/g, " ");
+  const direct = new Date(raw.replace(/\//g, "-").replace(" ", "T"));
+  if (!isNaN(direct.getTime())) return direct;
+
+  const m = raw.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (m) {
+    let a = parseInt(m[1], 10);
+    let b = parseInt(m[2], 10);
+    let year = parseInt(m[3], 10);
+    if (year < 100) year += 2000;
+    // Prefer DD/MM/YYYY unless first field is clearly month-impossible.
+    let day = a;
+    let month = b;
+    if (a <= 12 && b > 12) { day = b; month = a; }
+    const h = parseInt(m[4] || "0", 10);
+    const min = parseInt(m[5] || "0", 10);
+    const sec = parseInt(m[6] || "0", 10);
+    const d = new Date(year, month - 1, day, h, min, sec);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+function getAWSCell(row, key) {
+  if (!row || !key) return "";
+  const value = row[key];
+  return value == null ? "" : String(value).trim();
+}
+
+function getAWSDevice(row, colMap) {
+  const value = getAWSCell(row, colMap.device);
+  if (!value || value.toLowerCase() === "unknown" || value === "غير معروف") return "";
+  return value;
+}
+
+function getAWSEventName(row, colMap) {
+  const primary = getAWSCell(row, colMap.event);
+  if (primary && primary.toLowerCase() !== "unknown" && primary !== "غير معروف") return primary;
+  const sub = getAWSCell(row, colMap.subevent);
+  return sub && sub.toLowerCase() !== "unknown" && sub !== "غير معروف" ? sub : "";
+}
+
+function getAWSEventCode(row, colMap) {
+  const text = getAWSEventName(row, colMap);
+  const m = String(text || "").match(/\b(\d{2,5})\b/);
+  return m ? m[1] : "";
+}
+
+function getAWSRowBounds(row, colMap) {
+  const start = parseAWSDateValue(getAWSCell(row, colMap.start));
+  const end = parseAWSDateValue(getAWSCell(row, colMap.end)) || start;
+  return { start, end };
+}
+
+function dayKeyUTC(date) {
+  if (!(date instanceof Date) || isNaN(date.getTime())) return "";
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function isAWSWarning903(row, colMap) {
+  const category = classifyAWSCategory(row, colMap);
+  const eventName = getAWSEventName(row, colMap).toLowerCase();
+  const code = getAWSEventCode(row, colMap);
+  if (category !== "Warning") return false;
+  if (code === "903") return true;
+  return eventName.includes("903") && (eventName.includes("person") || eventName.includes("authoriz") || eventName.includes("turbine"));
+}
+
+function buildAWSEmergencyIncidents(rows, colMap) {
+  const MERGE_GAP_MS = 5 * 60 * 1000;
+  const intervals = [];
+  for (const row of rows || []) {
+    const category = classifyAWSCategory(row, colMap);
+    const eventName = getAWSEventName(row, colMap);
+    if (category !== "State") continue;
+    if (!/windturbine/i.test(eventName) || !/(^|\b)emergency(\b|$)/i.test(eventName)) continue;
+    const bounds = getAWSRowBounds(row, colMap);
+    if (!bounds.start) continue;
+    intervals.push({ start: bounds.start, end: bounds.end || bounds.start });
+  }
+  intervals.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const item of intervals) {
+    if (!merged.length) { merged.push({ ...item }); continue; }
+    const last = merged[merged.length - 1];
+    if (item.start.getTime() <= last.end.getTime() + MERGE_GAP_MS) {
+      if (item.end.getTime() > last.end.getTime()) last.end = item.end;
+    } else {
+      merged.push({ ...item });
+    }
+  }
+  return merged;
+}
+
+function medianNumber(values) {
+  const arr = (values || []).filter(Number.isFinite).sort((a, b) => a - b);
+  if (!arr.length) return null;
+  const mid = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+}
+
+function buildAWSBackendAnalysis(rows, colMap) {
+  const categories = { Alarm: { count: 0, durationSeconds: 0 }, State: { count: 0, durationSeconds: 0 }, Warning: { count: 0, durationSeconds: 0 }, Other: { count: 0, durationSeconds: 0 } };
+  const devices = new Map();
+  const events = new Map();
+  const dateKeys = new Set();
+  const excludedWarning903Turbines = new Set();
+
+  for (const row of rows || []) {
+    const category = classifyAWSCategory(row, colMap);
+    const device = getAWSDevice(row, colMap);
+    const eventName = getAWSEventName(row, colMap) || "Unknown";
+    const durationSeconds = parseAWSDurationSeconds(getAWSCell(row, colMap.duration));
+    const bounds = getAWSRowBounds(row, colMap);
+    if (bounds.start) dateKeys.add(dayKeyUTC(bounds.start));
+    if (categories[category]) {
+      categories[category].count += 1;
+      categories[category].durationSeconds += durationSeconds;
+    }
+    if (device) {
+      if (!devices.has(device)) devices.set(device, { device, totalCount: 0, totalDurationSeconds: 0, alarmCount: 0, warningCount: 0, stateCount: 0 });
+      const d = devices.get(device);
+      d.totalCount += 1;
+      d.totalDurationSeconds += durationSeconds;
+      if (category === "Alarm") d.alarmCount += 1;
+      else if (category === "Warning") d.warningCount += 1;
+      else if (category === "State") d.stateCount += 1;
+      if (isAWSWarning903(row, colMap)) excludedWarning903Turbines.add(device);
+    }
+    const eventKey = `${category}||${eventName}`;
+    if (!events.has(eventKey)) events.set(eventKey, { category, eventName, count: 0, durationSeconds: 0, devices: new Map() });
+    const e = events.get(eventKey);
+    e.count += 1;
+    e.durationSeconds += durationSeconds;
+    if (device) e.devices.set(device, (e.devices.get(device) || 0) + 1);
+  }
+
+  const topDurationByDevice = Array.from(devices.values())
+    .sort((a, b) => (b.totalDurationSeconds - a.totalDurationSeconds) || (b.totalCount - a.totalCount) || a.device.localeCompare(b.device))
+    .slice(0, 20)
+    .map((item) => ({ ...item, totalDurationFormatted: formatAWSDuration(item.totalDurationSeconds) }));
+
+  const eventSummary = Array.from(events.values())
+    .map((item) => ({
+      category: item.category,
+      eventName: item.eventName,
+      count: item.count,
+      durationSeconds: item.durationSeconds,
+      durationFormatted: formatAWSDuration(item.durationSeconds),
+      devicesCount: item.devices.size,
+      turbineBreakdown: Array.from(item.devices.entries()).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0])).slice(0, 20).map(([device, count]) => `${device} (${count})`).join(" • ")
+    }))
+    .sort((a, b) => (b.count - a.count) || (b.durationSeconds - a.durationSeconds) || a.eventName.localeCompare(b.eventName));
+
+  const topRepeatedAlarmWarning = eventSummary
+    .filter((item) => item.category === "Alarm" || item.category === "Warning")
+    .filter((item) => !(item.category === "Warning" && /(^|\D)903(\D|$)/.test(item.eventName)))
+    .map((item) => {
+      const original = events.get(`${item.category}||${item.eventName}`);
+      const kept = Array.from(original.devices.entries()).filter(([device]) => !excludedWarning903Turbines.has(device));
+      const totalCount = kept.reduce((sum, [, count]) => sum + count, 0);
+      return {
+        category: item.category,
+        eventName: item.eventName,
+        totalCount,
+        turbineBreakdown: kept.sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0])).slice(0, 20).map(([device, count]) => `${device} (${count})`).join(" • ")
+      };
+    })
+    .filter((item) => item.totalCount > 0)
+    .sort((a, b) => (b.totalCount - a.totalCount) || a.eventName.localeCompare(b.eventName))
+    .slice(0, 20);
+
+  const rowsByDevice = new Map();
+  for (const row of rows || []) {
+    const device = getAWSDevice(row, colMap);
+    if (!device) continue;
+    if (!rowsByDevice.has(device)) rowsByDevice.set(device, []);
+    rowsByDevice.get(device).push(row);
+  }
+
+  const emergencyRows = [];
+  const allEmergencyIntervals = [];
+  for (const [device, deviceRows] of rowsByDevice.entries()) {
+    const incidents = buildAWSEmergencyIncidents(deviceRows, colMap);
+    if (!incidents.length) continue;
+    const alarmRows = deviceRows
+      .map((row) => {
+        const bounds = getAWSRowBounds(row, colMap);
+        const category = classifyAWSCategory(row, colMap);
+        if (!bounds.start || category !== "Alarm") return null;
+        return { start: bounds.start, end: bounds.end || bounds.start, eventName: getAWSEventName(row, colMap) || "Unknown alarm" };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.start - b.start);
+    const priorAlarmCounts = {};
+    for (const incident of incidents) {
+      let latest = null;
+      for (const alarm of alarmRows) {
+        if (alarm.start.getTime() < incident.start.getTime()) latest = alarm;
+        else break;
+      }
+      if (latest && latest.eventName) priorAlarmCounts[latest.eventName] = (priorAlarmCounts[latest.eventName] || 0) + 1;
+    }
+    const gaps = [];
+    for (let i = 1; i < incidents.length; i += 1) {
+      const minutes = Math.max(0, (incidents[i].start.getTime() - incidents[i - 1].end.getTime()) / 60000);
+      gaps.push(minutes);
+      allEmergencyIntervals.push(minutes);
+    }
+    const sortedGaps = gaps.slice().sort((a, b) => a - b);
+    const topPriorAlarms = Object.entries(priorAlarmCounts).sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0])).slice(0, 3).map(([name, count]) => `${name} (${count})`);
+    emergencyRows.push({
+      device,
+      incidentCount: incidents.length,
+      gapSamples: gaps.length,
+      avgGapMinutes: gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : null,
+      medianGapMinutes: medianNumber(gaps),
+      minGapMinutes: sortedGaps.length ? sortedGaps[0] : null,
+      maxGapMinutes: sortedGaps.length ? sortedGaps[sortedGaps.length - 1] : null,
+      topPriorAlarms,
+      lastEmergencyStart: incidents[incidents.length - 1].start ? incidents[incidents.length - 1].start.toISOString() : ""
+    });
+  }
+  emergencyRows.sort((a, b) => (b.incidentCount - a.incidentCount) || ((a.avgGapMinutes ?? Number.POSITIVE_INFINITY) - (b.avgGapMinutes ?? Number.POSITIVE_INFINITY)) || a.device.localeCompare(b.device));
+
+  return {
+    version: "aws-backend-analysis-v2",
+    rowsAnalyzed: Array.isArray(rows) ? rows.length : 0,
+    categories: Object.fromEntries(Object.entries(categories).map(([key, value]) => [key, { ...value, durationFormatted: formatAWSDuration(value.durationSeconds) }])),
+    datesCount: Array.from(dateKeys).filter(Boolean).length,
+    devicesCount: devices.size,
+    eventsCount: events.size,
+    excludedWarning903Turbines: Array.from(excludedWarning903Turbines).sort(),
+    topDurationByDevice,
+    topRepeatedAlarmWarning,
+    eventSummary: eventSummary.slice(0, 50),
+    emergencyRecurrence: {
+      totalTurbines: emergencyRows.length,
+      totalIncidents: emergencyRows.reduce((sum, row) => sum + row.incidentCount, 0),
+      avgGapMinutes: allEmergencyIntervals.length ? allEmergencyIntervals.reduce((a, b) => a + b, 0) / allEmergencyIntervals.length : null,
+      medianGapMinutes: medianNumber(allEmergencyIntervals),
+      rows: emergencyRows.slice(0, 50)
+    }
+  };
+}
+
 async function handleAWSUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
@@ -237,6 +529,7 @@ async function handleAWSUpload(request, env) {
   const parsed = await parseGenericTableFile(file, "aws");
   const selectedColumns = autoMapAWSColumns(parsed.columns);
   const summary = summarizeAWSRows(parsed.data, selectedColumns);
+  const analysis = buildAWSBackendAnalysis(parsed.data, selectedColumns);
 
   return jsonResponse(request, env, {
     success: true,
@@ -260,7 +553,8 @@ async function handleAWSUpload(request, env) {
       data: parsed.data
     },
     selectedColumns,
-    summary
+    summary,
+    analysis
   });
 }
 
