@@ -14,15 +14,18 @@ function jsonResponse(request, env, body, status = 200) {
 }
 
 function corsHeaders(request, env) {
-  // The dashboard does not use cookies/credentials for Worker calls.
-  // Wildcard CORS prevents Cloudflare Pages -> Worker uploads from being blocked
-  // even when the Worker returns an error response during parsing.
+  const requestOrigin = request.headers.get("Origin") || "*";
+  const allowedRaw = env.ALLOWED_ORIGIN || "*";
+  const allowed = allowedRaw.split(",").map((item) => item.trim()).filter(Boolean);
+  const allowOrigin = allowed.includes("*") || allowed.includes(requestOrigin)
+    ? requestOrigin
+    : allowed[0] || "*";
+
   return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, Accept, Origin",
-    "Access-Control-Max-Age": "86400",
-    "Vary": "Origin"
+    "access-control-allow-origin": allowOrigin,
+    "access-control-allow-methods": "GET,POST,OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400"
   };
 }
 
@@ -94,81 +97,6 @@ function stringifyRowsForBrowser(rows) {
   });
 }
 
-function splitAWSDelimitedLine(line, delimiter) {
-  const result = [];
-  let current = "";
-  let quoted = false;
-  const text = String(line || "");
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch === '"') {
-      if (quoted && text[i + 1] === '"') {
-        current += '"';
-        i += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (ch === delimiter && !quoted) {
-      result.push(current);
-      current = "";
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
-function detectAWSDelimiter(firstLine) {
-  const candidates = [",", ";", "\t", "|"];
-  let best = ",";
-  let bestCount = 0;
-  for (const delimiter of candidates) {
-    const count = splitAWSDelimitedLine(firstLine, delimiter).length;
-    if (count > bestCount) {
-      best = delimiter;
-      bestCount = count;
-    }
-  }
-  return best;
-}
-
-function parseAWSDelimitedText(text) {
-  const cleanText = String(text || "").replace(/^\uFEFF/, "");
-  const physicalLines = cleanText.split(/\r\n|\n|\r/);
-  const firstNonEmpty = physicalLines.find((line) => String(line || "").trim() !== "") || "";
-  const delimiter = detectAWSDelimiter(firstNonEmpty);
-  const records = [];
-  let current = "";
-  let quoteCount = 0;
-  for (const line of physicalLines) {
-    current += (current ? "\n" : "") + line;
-    for (let i = 0; i < line.length; i += 1) {
-      if (line[i] === '"') quoteCount += 1;
-    }
-    if (quoteCount % 2 === 1) continue;
-    const record = splitAWSDelimitedLine(current, delimiter).map((cell) => String(cell == null ? "" : cell).trim());
-    records.push(record);
-    current = "";
-    quoteCount = 0;
-  }
-  if (current) records.push(splitAWSDelimitedLine(current, delimiter).map((cell) => String(cell == null ? "" : cell).trim()));
-  while (records.length && records[0].every((cell) => !String(cell || "").trim())) records.shift();
-  const header = (records.shift() || []).map((cell) => String(cell || "").trim());
-  const rows = [];
-  for (const record of records) {
-    if (!record || record.every((cell) => !String(cell || "").trim())) continue;
-    const row = {};
-    header.forEach((h, index) => {
-      if (!h) return;
-      row[h] = record[index] != null ? String(record[index]).trim() : "";
-    });
-    rows.push(row);
-  }
-  const columns = header.filter(Boolean);
-  return { columns, header: columns, data: rows };
-}
-
 function orderedColumnsFromRows(rows) {
   const columns = [];
   const seen = new Set();
@@ -192,27 +120,24 @@ async function parseGenericTableFile(file, label) {
   const bytes = new Uint8Array(arrayBuffer);
   const fileName = file.name || label;
   const lowerName = fileName.toLowerCase();
-  let sheetName = "CSV";
-  let parsedTextTable;
+  let workbook;
 
   if (lowerName.endsWith(".csv") || lowerName.endsWith(".txt")) {
-    const text = new TextDecoder("utf-8").decode(bytes).replace(/^﻿/, "");
-    parsedTextTable = parseAWSDelimitedText(text);
+    const text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
+    workbook = XLSX.read(text, { type: "string", cellDates: false, raw: false });
   } else {
-    const workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
-    if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
-      throw new Error(`${label} file does not contain any sheets.`);
-    }
-    sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    // Match the old frontend-only AWS behavior: Excel -> CSV text -> the same CSV parser.
-    // This preserves Start Date, End Date and Total Duration values exactly as the AWS UI expects.
-    const csv = XLSX.utils.sheet_to_csv(sheet, { FS: ",", RS: "\n", blankrows: false });
-    parsedTextTable = parseAWSDelimitedText(csv);
+    workbook = XLSX.read(bytes, { type: "array", cellDates: false, raw: false });
   }
 
-  const rows = stringifyRowsForBrowser(parsedTextTable.data).filter((row) => Object.values(row).some((value) => String(value || "").trim() !== ""));
-  const columns = parsedTextTable.columns && parsedTextTable.columns.length ? parsedTextTable.columns : orderedColumnsFromRows(rows);
+  if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+    throw new Error(`${label} file does not contain any sheets.`);
+  }
+
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+  const rows = stringifyRowsForBrowser(rawRows).filter((row) => Object.values(row).some((value) => String(value || "").trim() !== ""));
+  const columns = orderedColumnsFromRows(rows);
 
   return {
     label,
@@ -384,12 +309,7 @@ function getAWSEventCode(row, colMap) {
 
 function getAWSRowBounds(row, colMap) {
   const start = parseAWSDateValue(getAWSCell(row, colMap.start));
-  let end = parseAWSDateValue(getAWSCell(row, colMap.end));
-  if (start && !end && colMap.duration) {
-    const sec = parseAWSDurationSeconds(getAWSCell(row, colMap.duration));
-    if (sec > 0) end = new Date(start.getTime() + sec * 1000);
-  }
-  if (!end) end = start;
+  const end = parseAWSDateValue(getAWSCell(row, colMap.end)) || start;
   return { start, end };
 }
 
@@ -579,394 +499,6 @@ function buildAWSBackendAnalysis(rows, colMap) {
   };
 }
 
-
-
-function splitXMinCsvLine(line, delimiter) {
-  const out = [];
-  let cur = "";
-  let quoted = false;
-  const text = String(line || "");
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch === '"') {
-      if (quoted && text[i + 1] === '"') {
-        cur += '"';
-        i += 1;
-      } else {
-        quoted = !quoted;
-      }
-    } else if (ch === delimiter && !quoted) {
-      out.push(cur);
-      cur = "";
-    } else {
-      cur += ch;
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
-function detectXMinDelimiter(headerLine) {
-  const text = String(headerLine || "");
-  const candidates = [";", ",", "\t"];
-  let best = ";";
-  let bestCount = -1;
-  for (const delimiter of candidates) {
-    const count = (text.match(new RegExp(delimiter === "\t" ? "\\t" : delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length;
-    if (count > bestCount) {
-      best = delimiter;
-      bestCount = count;
-    }
-  }
-  return best;
-}
-
-function normalizeXMinCell(value) {
-  return String(value == null ? "" : value).replace(/^\uFEFF/, "").trim();
-}
-
-async function parseXMinTextFile(file, label = "xmin") {
-  if (!file || typeof file.arrayBuffer !== "function") {
-    throw new Error(`${label} is not a valid uploaded file.`);
-  }
-  const arrayBuffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(arrayBuffer);
-  let text = new TextDecoder("utf-8").decode(bytes).replace(/^\uFEFF/, "");
-  text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  const lines = text.split("\n").filter((line) => String(line || "").trim() !== "");
-
-  if (!lines.length) {
-    return {
-      label,
-      fileName: file.name || label,
-      fileType: file.type || "text/csv",
-      fileSizeBytes: file.size || bytes.byteLength,
-      rowsCount: 0,
-      delimiter: ";",
-      columns: [],
-      variables: [],
-      devices: [],
-      rows: [],
-      preview: []
-    };
-  }
-
-  const delimiter = detectXMinDelimiter(lines[0]);
-  const headers = splitXMinCsvLine(lines[0], delimiter).map((header, index) => normalizeXMinCell(header) || `Column ${index + 1}`);
-  const rows = [];
-  for (let i = 1; i < lines.length; i += 1) {
-    const cells = splitXMinCsvLine(lines[i], delimiter);
-    if (cells.length !== headers.length) continue;
-    const obj = {};
-    for (let j = 0; j < headers.length; j += 1) {
-      let key = headers[j] || `Column ${j + 1}`;
-      key = key.replace(/^\uFEFF/, "").trim();
-      let value = normalizeXMinCell(cells[j]);
-      if (key === "Date") value = value.replace("T", " ");
-      obj[key] = value;
-    }
-    if (obj["\uFEFFDevice"]) {
-      obj.Device = obj["\uFEFFDevice"];
-      delete obj["\uFEFFDevice"];
-    }
-    if (Object.values(obj).some((value) => String(value || "").trim() !== "")) rows.push(obj);
-  }
-
-  const columns = rows.length ? orderedColumnsFromRows(rows) : headers.filter(Boolean);
-  const variables = columns.filter((key) => key !== "Device" && key !== "Date");
-  const devices = Array.from(new Set(rows.map((row) => String(row.Device || "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b));
-
-  return {
-    label,
-    fileName: file.name || label,
-    fileType: file.type || "text/csv",
-    fileSizeBytes: file.size || bytes.byteLength,
-    rowsCount: rows.length,
-    delimiter,
-    columns,
-    variables,
-    devices,
-    rows,
-    preview: rows.slice(0, MAX_PREVIEW_ROWS)
-  };
-}
-
-
-function parseXMinNumber(value) {
-  if (value == null) return NaN;
-  let text = String(value).trim().replace(/\u00a0/g, "").replace(/\s+/g, "");
-  if (!text) return NaN;
-  const commaCount = (text.match(/,/g) || []).length;
-  const dotCount = (text.match(/\./g) || []).length;
-  if (commaCount > dotCount) {
-    text = text.replace(/\./g, "").replace(/,/g, ".");
-  } else {
-    text = text.replace(/,/g, "");
-  }
-  const n = Number(text);
-  return Number.isFinite(n) ? n : NaN;
-}
-
-function parseXMinDateMs(value) {
-  const text = String(value == null ? "" : value).trim().replace("T", " ");
-  if (!text) return NaN;
-  const direct = Date.parse(text);
-  if (Number.isFinite(direct)) return direct;
-  const parts = text.split(/\s+/);
-  const datePart = parts[0] || "";
-  const timePart = parts[1] || "00:00:00";
-  const d = datePart.split(/[\/\-]/).map((x) => parseInt(x, 10));
-  const t = timePart.split(":");
-  if (d.length < 3 || d.some((x) => !Number.isFinite(x))) return NaN;
-  const secRaw = String(t[2] || "0").replace(",", ".");
-  const secFloat = parseFloat(secRaw);
-  const sec = Number.isFinite(secFloat) ? Math.floor(secFloat) : 0;
-  const ms = Number.isFinite(secFloat) ? Math.round((secFloat - sec) * 1000) : 0;
-  // X-Minute files normally use yyyy/mm/dd or yyyy-mm-dd.
-  return new Date(d[0], (d[1] || 1) - 1, d[2] || 1, parseInt(t[0], 10) || 0, parseInt(t[1], 10) || 0, sec, ms).getTime();
-}
-
-function inferXMinCategoryBackend(variableName) {
-  const lower = String(variableName || "").toLowerCase();
-  if (lower.includes("bearing")) return "Bearing";
-  if (lower.includes("gearbox")) return "Gearbox";
-  if (lower.includes("generator")) return "Generator";
-  if (lower.includes("slipring")) return "Sliprings";
-  if (lower.includes("trafo")) return "Trafo";
-  if (lower.includes("temperature") || lower.includes("temp")) return "Temperature";
-  if (lower.startsWith("average")) return "Average";
-  return "Other";
-}
-
-const XMIN_LIMIT_RULES = [
-  { match: /\bBearing\s+D\.?E\.?\s+Temperature\b.*10\s*M/i, limit: 95, label: "Bearing D.E. Temperature" },
-  { match: /\bBearing\s+N\.?D\.?E\.?\s+Temperature\b.*10\s*M/i, limit: 95, label: "Bearing N.D.E. Temperature" },
-  { match: /\bGearbox\b.*bearing\s+temperature\b.*10\s*M/i, limit: 88, label: "Gearbox bearing temperature" },
-  { match: /\bGearbox\b.*oil\s+temperature\b.*10\s*M/i, limit: 75, label: "Gearbox oil temperature" },
-  { match: /\bGenerator\b.*windings\s+temperature\s*1\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 1" },
-  { match: /\bGenerator\b.*windings\s+temperature\s*2\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 2" },
-  { match: /\bGenerator\b.*windings\s+temperature\s*3\b.*10\s*M/i, limit: 150, label: "Generator windings temperature 3" },
-  { match: /\bGenerator\b.*sliprings\s+temperature\b.*10\s*M/i, limit: 75, label: "Generator sliprings temperature" },
-  { match: /\bTrafo\s*1\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 1 winding temperature" },
-  { match: /\bTrafo\s*2\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 2 winding temperature" },
-  { match: /\bTrafo\s*3\b.*winding\s+temperature\b.*10\s*M/i, limit: 140, label: "Trafo 3 winding temperature" }
-];
-
-function findXMinLimitRule(variableName) {
-  const text = String(variableName || "").replace(/\s+/g, " ").trim();
-  return XMIN_LIMIT_RULES.find((rule) => rule.match.test(text)) || null;
-}
-
-function roundXMin(value, digits = 3) {
-  if (!Number.isFinite(value)) return null;
-  const factor = Math.pow(10, digits);
-  return Math.round(value * factor) / factor;
-}
-
-function computeXMinAnalysis(parsed) {
-  const rows = Array.isArray(parsed?.rows) ? parsed.rows : [];
-  const variables = Array.isArray(parsed?.variables) ? parsed.variables : [];
-  const devices = Array.isArray(parsed?.devices) ? parsed.devices : [];
-  const categories = {};
-  const deviceMap = new Map();
-  const variableMap = new Map();
-  const limitRules = new Map();
-  let minMs = Infinity;
-  let maxMs = -Infinity;
-  let firstDate = "";
-  let lastDate = "";
-  let exceedanceCount = 0;
-  const affectedDevices = new Set();
-  const affectedVariables = new Set();
-  const exceedanceRows = [];
-
-  for (const variable of variables) {
-    const category = inferXMinCategoryBackend(variable);
-    categories[category] = (categories[category] || 0) + 1;
-    variableMap.set(variable, {
-      variable,
-      category,
-      numericCount: 0,
-      min: Infinity,
-      max: -Infinity,
-      sum: 0,
-      avg: null,
-      maxDevice: "",
-      maxDate: "",
-      exceedanceLimit: null,
-      exceedanceCount: 0
-    });
-    const rule = findXMinLimitRule(variable);
-    if (rule) {
-      limitRules.set(variable, rule);
-      variableMap.get(variable).exceedanceLimit = rule.limit;
-    }
-  }
-
-  for (const row of rows) {
-    const device = String(row.Device || "").trim() || "Unknown";
-    const date = String(row.Date || "").trim();
-    const ms = parseXMinDateMs(date);
-    if (Number.isFinite(ms)) {
-      if (ms < minMs) { minMs = ms; firstDate = date; }
-      if (ms > maxMs) { maxMs = ms; lastDate = date; }
-    }
-    if (!deviceMap.has(device)) {
-      deviceMap.set(device, { device, rowsCount: 0, firstDate: "", lastDate: "", firstMs: Infinity, lastMs: -Infinity, exceedanceCount: 0 });
-    }
-    const devRec = deviceMap.get(device);
-    devRec.rowsCount += 1;
-    if (Number.isFinite(ms)) {
-      if (ms < devRec.firstMs) { devRec.firstMs = ms; devRec.firstDate = date; }
-      if (ms > devRec.lastMs) { devRec.lastMs = ms; devRec.lastDate = date; }
-    }
-
-    for (const variable of variables) {
-      const n = parseXMinNumber(row[variable]);
-      if (!Number.isFinite(n)) continue;
-      const rec = variableMap.get(variable);
-      if (!rec) continue;
-      rec.numericCount += 1;
-      rec.sum += n;
-      if (n < rec.min) rec.min = n;
-      if (n > rec.max) {
-        rec.max = n;
-        rec.maxDevice = device;
-        rec.maxDate = date;
-      }
-      const rule = limitRules.get(variable);
-      if (rule && n > rule.limit) {
-        exceedanceCount += 1;
-        affectedDevices.add(device);
-        affectedVariables.add(variable);
-        rec.exceedanceCount += 1;
-        devRec.exceedanceCount += 1;
-        if (exceedanceRows.length < 1000) {
-          exceedanceRows.push({
-            device,
-            variable,
-            date,
-            value: roundXMin(n, 3),
-            limit: rule.limit,
-            exceedBy: roundXMin(n - rule.limit, 3)
-          });
-        }
-      }
-    }
-  }
-
-  const variableStats = Array.from(variableMap.values()).map((rec) => ({
-    variable: rec.variable,
-    category: rec.category,
-    numericCount: rec.numericCount,
-    min: rec.numericCount ? roundXMin(rec.min, 3) : null,
-    max: rec.numericCount ? roundXMin(rec.max, 3) : null,
-    avg: rec.numericCount ? roundXMin(rec.sum / rec.numericCount, 3) : null,
-    maxDevice: rec.maxDevice,
-    maxDate: rec.maxDate,
-    exceedanceLimit: rec.exceedanceLimit,
-    exceedanceCount: rec.exceedanceCount
-  }));
-
-  const deviceStats = Array.from(deviceMap.values()).map((rec) => ({
-    device: rec.device,
-    rowsCount: rec.rowsCount,
-    firstDate: rec.firstDate,
-    lastDate: rec.lastDate,
-    exceedanceCount: rec.exceedanceCount
-  })).sort((a, b) => b.rowsCount - a.rowsCount || a.device.localeCompare(b.device));
-
-  const temperatureHotspots = variableStats
-    .filter((rec) => /temp|temperature/i.test(rec.variable) && Number.isFinite(rec.max))
-    .sort((a, b) => (b.max ?? -Infinity) - (a.max ?? -Infinity))
-    .slice(0, 50);
-
-  const topExceedanceVariables = variableStats
-    .filter((rec) => rec.exceedanceCount > 0)
-    .sort((a, b) => b.exceedanceCount - a.exceedanceCount || String(a.variable).localeCompare(String(b.variable)))
-    .slice(0, 50);
-
-  exceedanceRows.sort((a, b) => (b.exceedBy || 0) - (a.exceedBy || 0));
-
-  return {
-    phase: "backend-analysis",
-    calculatedAt: new Date().toISOString(),
-    totalRows: rows.length,
-    devicesCount: devices.length,
-    variablesCount: variables.length,
-    dateRange: {
-      first: firstDate,
-      last: lastDate
-    },
-    categories,
-    deviceStats,
-    variableStats,
-    temperatureHotspots,
-    exceedances: {
-      total: exceedanceCount,
-      returnedRows: exceedanceRows.length,
-      affectedDevices: affectedDevices.size,
-      affectedVariables: affectedVariables.size,
-      topVariables: topExceedanceVariables,
-      rows: exceedanceRows
-    }
-  };
-}
-
-async function handleXMinUpload(request, env) {
-  const contentType = request.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().includes("multipart/form-data")) {
-    return jsonResponse(request, env, {
-      success: false,
-      message: "Expected multipart/form-data with an X-Minute CSV file."
-    }, 400);
-  }
-
-  const form = await request.formData();
-  const file = form.get("file") || form.get("xmin") || form.get("csv");
-  if (!file || typeof file.arrayBuffer !== "function") {
-    return jsonResponse(request, env, {
-      success: false,
-      message: "No valid X-Minute file was uploaded. Send a file field named file, xmin, or csv."
-    }, 400);
-  }
-
-  const parsed = await parseXMinTextFile(file, "xmin");
-  const analysis = computeXMinAnalysis(parsed);
-  return jsonResponse(request, env, {
-    success: true,
-    module: "X-Minute",
-    phase: "backend-upload-parse-and-analysis",
-    storageMode: "temporary-request-memory",
-    persistentStorage: false,
-    note: "X-Minute file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
-    receivedAt: new Date().toISOString(),
-    file: {
-      fileName: parsed.fileName,
-      fileType: parsed.fileType,
-      fileSizeBytes: parsed.fileSizeBytes,
-      rowsCount: parsed.rowsCount,
-      delimiter: parsed.delimiter,
-      columns: parsed.columns,
-      variables: parsed.variables,
-      devices: parsed.devices,
-      preview: parsed.preview
-    },
-    parsed: {
-      header: parsed.columns,
-      variables: parsed.variables,
-      devices: parsed.devices,
-      data: parsed.rows
-    },
-    analysis,
-    summary: {
-      totalRows: parsed.rowsCount,
-      devicesCount: parsed.devices.length,
-      variablesCount: parsed.variables.length
-    }
-  });
-}
-
 async function handleAWSUpload(request, env) {
   const contentType = request.headers.get("content-type") || "";
   if (!contentType.toLowerCase().includes("multipart/form-data")) {
@@ -993,7 +525,7 @@ async function handleAWSUpload(request, env) {
   return jsonResponse(request, env, {
     success: true,
     module: "AWS",
-    phase: "backend-upload-parse-and-analysis",
+    phase: "backend-upload-parse",
     storageMode: "temporary-request-memory",
     persistentStorage: false,
     note: "AWS file was parsed inside Cloudflare Worker memory for this request only. It is not saved after the response is returned.",
@@ -1576,9 +1108,9 @@ export default {
       if (url.pathname === "/" || url.pathname === "/api/health") {
         return jsonResponse(request, env, {
           success: true,
-          service: "WTG Cloudflare Backend",
+          service: "WTG AAW Cloudflare Backend",
           status: "ok",
-          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare", "POST /api/aws/upload", "POST /api/xmin/upload"],
+          endpoints: ["POST /api/aaw/upload", "POST /api/aaw/compare", "POST /api/aws/upload"],
           storageMode: "temporary-request-memory"
         });
       }
@@ -1593,10 +1125,6 @@ export default {
 
       if (url.pathname === "/api/aws/upload" && request.method === "POST") {
         return await handleAWSUpload(request, env);
-      }
-
-      if (url.pathname === "/api/xmin/upload" && request.method === "POST") {
-        return await handleXMinUpload(request, env);
       }
 
       return jsonResponse(request, env, {
